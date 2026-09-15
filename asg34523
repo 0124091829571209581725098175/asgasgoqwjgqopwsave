@@ -37,7 +37,7 @@ local SaveManager = {} do
 		},
 		Dropdown = {
 			Save = function(idx, object)
-				return { type = 'Dropdown', idx = idx, value = object.Value, mutli = object.Multi }
+				return { type = 'Dropdown', idx = idx, value = object.Value, multi = object.Multi }
 			end,
 			Load = function(idx, data)
 				if Options[idx] then 
@@ -150,26 +150,31 @@ local SaveManager = {} do
 				local optType = option.type
 				local optIdx = option.idx
 				local optData = option
-				task.spawn(function()
-					local loaded = false
-					for _ = 1, 50 do
-						local target = nil
-						if optType == 'Toggle' then
-							target = Toggles[optIdx]
-						else
-							target = Options[optIdx]
+				local target = nil
+				if optType == 'Toggle' then
+					target = Toggles[optIdx]
+				else
+					target = Options[optIdx]
+				end
+				if target ~= nil then
+					pcall(function() self.Parser[optType].Load(optIdx, optData) end)
+				else
+					task.spawn(function()
+						for _ = 1, 50 do
+							local t = nil
+							if optType == 'Toggle' then
+								t = Toggles[optIdx]
+							else
+								t = Options[optIdx]
+							end
+							if t ~= nil then
+								pcall(function() self.Parser[optType].Load(optIdx, optData) end)
+								break
+							end
+							task.wait(0.1)
 						end
-						if target ~= nil then
-							pcall(function() self.Parser[optType].Load(optIdx, optData) end)
-							loaded = true
-							break
-						end
-						task.wait(0.1)
-					end
-					if not loaded then
-						pcall(function() self.Parser[optType].Load(optIdx, optData) end)
-					end
-				end)
+					end)
+				end
 			end
 		end
 
