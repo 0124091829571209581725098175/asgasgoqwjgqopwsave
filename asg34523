@@ -53,32 +53,51 @@ local SaveManager = {} do
 			Save = function(idx, object) 
 				-- ensure boolean
 				local v = object.Value
-				if type(v) ~= 'boolean' then v = not not v end
-				return { type = 'Toggle', idx = idx, value = v } 
+				if type(v) ~= "boolean" then v = not not v end
+				return { type = "Toggle", idx = idx, value = v } 
 			end,
 			Load = function(idx, data)
-				local t = getToggles()
-				local o = getOptions()
-				local obj = (t and t[idx]) or (o and o[idx])
-				if not obj then
-					-- also try global direct
-					if Toggles and Toggles[idx] then obj = Toggles[idx]
-					elseif Options and Options[idx] then obj = Options[idx] end
-				end
-				if obj and obj.SetValue then
-					local v = data.value
-					-- handle string "true"/"false" or 1/0
-					if type(v) == 'string' then
-						local low = v:lower()
-						if low == 'true' or low == '1' then v = true
-						elseif low == 'false' or low == '0' then v = false
-						else v = not not v end
-					elseif type(v) == 'number' then
-						v = v ~= 0
-					elseif type(v) ~= 'boolean' then
-						v = not not v
+				local function findToggle(key)
+					local cands = {}
+					local t = getToggles(); if t then table.insert(cands, t) end
+					local o = getOptions(); if o and o ~= t then table.insert(cands, o) end
+					if Toggles and Toggles ~= t then table.insert(cands, Toggles) end
+					if Options and Options ~= o then table.insert(cands, Options) end
+					for _,tbl in ipairs(cands) do
+						if tbl[key] then return tbl[key] end
 					end
-					pcall(function() obj:SetValue(v) end)
+					local low = key:lower()
+					for _,tbl in ipairs(cands) do
+						for k,v in pairs(tbl) do
+							if type(k)=="string" and k:lower()==low and v and v.Type=="Toggle" then return v end
+						end
+					end
+					return nil
+				end
+				local obj = findToggle(idx)
+				if obj then
+					local v = data.value
+					if type(v) == "string" then
+						local low = v:lower()
+						if low == "true" or low == "1" then v = true
+						elseif low == "false" or low == "0" then v = false
+						else v = not not v end
+					elseif type(v) == "number" then
+						v = v ~= 0
+					elseif type(v) ~= "boolean" then
+						v = v and true or false
+					end
+					local ok = pcall(function() obj:SetValue(v) end)
+					if not ok then
+						pcall(function()
+							obj.Value = v
+							if obj.Display then obj:Display() end
+						end)
+					end
+					if obj.Value ~= v then
+						obj.Value = v
+						pcall(function() if obj.Display then obj:Display() end end)
+					end
 				end
 			end,
 		},
@@ -269,33 +288,26 @@ local SaveManager = {} do
 		if not success then return false, 'decode error' end
 		if type(decoded) ~= 'table' or type(decoded.objects) ~= 'table' then return false, 'decode error' end
 
-		local allToggles = getToggles()
-		local allOptions = getOptions()
+		-- suppress autosave while loading to prevent overwriting with partial state
+		local prevSuppress = Library and Library.SuppressSave
+		if Library then Library.SuppressSave = true end
+		-- use robust loader that directly calls parser (parser does its own lookup + case-insensitive)
 		for _, option in next, decoded.objects do
 			if type(option) == 'table' and option.type and self.Parser[option.type] then
 				local optType = option.type
 				local optIdx = option.idx
 				local optData = option
 				if type(optIdx) ~= 'string' then continue end
-				local target = nil
-				if optType == 'Toggle' then
-					target = (allToggles and allToggles[optIdx]) or (allOptions and allOptions[optIdx]) or (Toggles and Toggles[optIdx]) or (Options and Options[optIdx])
-				else
-					target = (allOptions and allOptions[optIdx]) or (allToggles and allToggles[optIdx]) or (Options and Options[optIdx]) or (Toggles and Toggles[optIdx])
+				-- always try immediate load, parser handles missing via internal find
+				local ok, err = pcall(function() self.Parser[optType].Load(optIdx, optData) end)
+				if not ok then
+					warn("[SaveManager] Load error for "..tostring(optIdx)..": "..tostring(err))
 				end
-				if target ~= nil then
-					pcall(function() self.Parser[optType].Load(optIdx, optData) end)
-				else
-					-- retry for late-created elements
-					task.spawn(function()
-						for _ = 1, 100 do
-							local t = nil
-							if optType == 'Toggle' then
-								local at = getToggles()
-								local ao = getOptions()
-								t = (at and at[optIdx]) or (ao and ao[optIdx]) or (Toggles and Toggles[optIdx]) or (Options and Options[optIdx])
-							else
-								local at = getToggles()
+				-- if still not applied, retry for late-created elements
+				-- check if value actually applied
+				task.spawn(function()
+					for _ = 1, 100 do
+						local at = getToggles()
 								local ao = getOptions()
 								t = (ao and ao[optIdx]) or (at and at[optIdx]) or (Options and Options[optIdx]) or (Toggles and Toggles[optIdx])
 							end
