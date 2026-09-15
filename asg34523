@@ -151,6 +151,7 @@ local SaveManager = {} do
 				local optIdx = option.idx
 				local optData = option
 				task.spawn(function()
+					local loaded = false
 					for _ = 1, 50 do
 						local target = nil
 						if optType == 'Toggle' then
@@ -160,11 +161,14 @@ local SaveManager = {} do
 						end
 						if target ~= nil then
 							pcall(function() self.Parser[optType].Load(optIdx, optData) end)
+							loaded = true
 							break
 						end
 						task.wait(0.1)
 					end
-					pcall(function() self.Parser[optType].Load(optIdx, optData) end)
+					if not loaded then
+						pcall(function() self.Parser[optType].Load(optIdx, optData) end)
+					end
 				end)
 			end
 		end
@@ -180,11 +184,13 @@ local SaveManager = {} do
 	end
 
 	function SaveManager:BuildFolderTree()
-		local paths = {
-			self.Folder,
-			self.Folder .. '/themes',
-			self.Folder .. '/settings'
-		}
+		local parts = self.Folder:split('/')
+		local paths = {}
+		for idx = 1, #parts do
+			paths[#paths + 1] = table.concat(parts, '/', 1, idx)
+		end
+		table.insert(paths, self.Folder .. '/themes')
+		table.insert(paths, self.Folder .. '/settings')
 
 		for i = 1, #paths do
 			local str = paths[i]
