@@ -4,6 +4,7 @@ local SaveManager = {} do
 	SaveManager.Folder = 'LinoriaLibSettings'
 	SaveManager.Ignore = {}
 	SaveManager.AutoloadLabel = nil
+	SaveManager.Library = nil
 
 	local function NormalizeConfigName(name)
 		if type(name) ~= 'string' then return nil end
@@ -15,7 +16,6 @@ local SaveManager = {} do
 		return clean
 	end
 
-	-- robust string split fallback if :split not available
 	local function split(str, delim)
 		if str.split then
 			local ok, res = pcall(function() return str:split(delim) end)
@@ -29,29 +29,30 @@ local SaveManager = {} do
 	end
 
 	local function getToggles()
+		if SaveManager.Library and SaveManager.Library.Toggles then return SaveManager.Library.Toggles end
 		if getgenv then
 			local ok, t = pcall(getgenv)
 			if ok and type(t) == 'table' and t.Toggles then return t.Toggles end
 		end
 		if getgenv and getgenv().Toggles then return getgenv().Toggles end
 		if _G and _G.Toggles then return _G.Toggles end
-		return Toggles
+		return (SaveManager.Library and SaveManager.Library.Toggles) or Toggles
 	end
 
 	local function getOptions()
+		if SaveManager.Library and SaveManager.Library.Options then return SaveManager.Library.Options end
 		if getgenv then
 			local ok, t = pcall(getgenv)
 			if ok and type(t) == 'table' and t.Options then return t.Options end
 		end
 		if getgenv and getgenv().Options then return getgenv().Options end
 		if _G and _G.Options then return _G.Options end
-		return Options
+		return (SaveManager.Library and SaveManager.Library.Options) or Options
 	end
 
 	SaveManager.Parser = {
 		Toggle = {
 			Save = function(idx, object) 
-				-- ensure boolean
 				local v = object.Value
 				if type(v) ~= "boolean" then v = not not v end
 				return { type = "Toggle", idx = idx, value = v } 
@@ -59,21 +60,28 @@ local SaveManager = {} do
 			Load = function(idx, data)
 				local function findToggle(key)
 					local cands = {}
-					local t = getToggles(); if t then table.insert(cands, t) end
+					local lib = SaveManager.Library
+					if lib and lib.Toggles then table.insert(cands, lib.Toggles) end
+					local t = getToggles(); if t and t ~= (lib and lib.Toggles) then table.insert(cands, t) end
 					local o = getOptions(); if o and o ~= t then table.insert(cands, o) end
 					if Toggles and Toggles ~= t then table.insert(cands, Toggles) end
 					if Options and Options ~= o then table.insert(cands, Options) end
-					for _,tbl in ipairs(cands) do
+
+					for _, tbl in ipairs(cands) do
 						if tbl[key] then return tbl[key] end
 					end
+
 					local low = key:lower()
-					for _,tbl in ipairs(cands) do
-						for k,v in pairs(tbl) do
-							if type(k)=="string" and k:lower()==low and v and v.Type=="Toggle" then return v end
+					for _, tbl in ipairs(cands) do
+						for k, v in pairs(tbl) do
+							if type(k) == "string" and k:lower() == low and v and (v.Type == "Toggle" or v.SetValue) then
+								return v
+							end
 						end
 					end
 					return nil
 				end
+
 				local obj = findToggle(idx)
 				if obj then
 					local v = data.value
@@ -85,18 +93,25 @@ local SaveManager = {} do
 					elseif type(v) == "number" then
 						v = v ~= 0
 					elseif type(v) ~= "boolean" then
-						v = v and true or false
+						v = not not v
 					end
-					local ok = pcall(function() obj:SetValue(v) end)
-					if not ok then
-						pcall(function()
-							obj.Value = v
-							if obj.Display then obj:Display() end
-						end)
+
+					if obj.SetValue then
+						local ok = pcall(function() obj:SetValue(v) end)
+						if not ok then
+							pcall(function()
+								obj.Value = v
+								if obj.Display then obj:Display() end
+							end)
+						end
+					else
+						obj.Value = v
+						if obj.Display then pcall(function() obj:Display() end) end
 					end
+
 					if obj.Value ~= v then
 						obj.Value = v
-						pcall(function() if obj.Display then obj:Display() end end)
+						if obj.Display then pcall(function() obj:Display() end) end
 					end
 				end
 			end,
@@ -110,7 +125,7 @@ local SaveManager = {} do
 				local t = getToggles()
 				local obj = (o and o[idx]) or (t and t[idx]) or (Options and Options[idx]) or (Toggles and Toggles[idx])
 				if obj and obj.SetValue then
-					local v = data.value
+					local v = tonumber(data.value) or data.value
 					if v ~= nil then
 						pcall(function() obj:SetValue(v) end)
 					end
@@ -165,7 +180,6 @@ local SaveManager = {} do
 				end
 			end,
 		},
-
 		Input = {
 			Save = function(idx, object)
 				return { type = 'Input', idx = idx, text = object.Value }
@@ -187,7 +201,7 @@ local SaveManager = {} do
 	end
 
 	function SaveManager:SetFolder(folder)
-		self.Folder = folder;
+		self.Folder = folder
 		self:BuildFolderTree()
 	end
 
@@ -205,13 +219,12 @@ local SaveManager = {} do
 
 		local allToggles = getToggles()
 		local allOptions = getOptions()
-		-- save toggles - be permissive: if it has Value and Type is Toggle-ish
+
 		if allToggles then
 			for idx, toggle in next, allToggles do
 				if self.Ignore[idx] then continue end
 				if toggle and type(toggle) == 'table' then
 					local typ = toggle.Type
-					-- allow missing Type if idx looks like toggle (has Value boolean)
 					if typ == "Toggle" or (typ == nil and type(toggle.Value) == 'boolean' and toggle.SetValue) then
 						typ = "Toggle"
 					end
@@ -239,20 +252,21 @@ local SaveManager = {} do
 			end
 		end
 
-		-- also check global fallbacks in case getgenv desync
+		-- Check fallback tables in case of environment divergence
 		if Toggles and Toggles ~= allToggles then
 			for idx, toggle in next, Toggles do
 				if self.Ignore[idx] then continue end
-				if toggle and toggle.Type == "Toggle" and not allToggles[idx] then
-					local ok, result = pcall(self.Parser[toggle.Type].Save, idx, toggle)
+				if toggle and toggle.Type == "Toggle" and not (allToggles and allToggles[idx]) then
+					local ok, result = pcall(self.Parser.Toggle.Save, idx, toggle)
 					if ok and result then table.insert(data.objects, result) end
 				end
 			end
 		end
+
 		if Options and Options ~= allOptions then
 			for idx, option in next, Options do
 				if self.Ignore[idx] then continue end
-				if option and self.Parser[option.Type] and not allOptions[idx] then
+				if option and option.Type and self.Parser[option.Type] and not (allOptions and allOptions[idx]) then
 					local ok, result = pcall(self.Parser[option.Type].Save, idx, option)
 					if ok and result then table.insert(data.objects, result) end
 				end
@@ -264,7 +278,6 @@ local SaveManager = {} do
 			return false, 'failed to encode data'
 		end
 
-		-- ensure folder exists before write
 		pcall(function() self:BuildFolderTree() end)
 
 		local ok, err = pcall(writefile, fullPath, encoded)
@@ -280,64 +293,66 @@ local SaveManager = {} do
 
 		local file = self.Folder .. '/settings/' .. clean .. '.json'
 		if not isfile(file) then
-			local alt = 'PhowgHosted/DaHood/settings/'..clean..'.json'
-			if isfile(alt) then file = alt else return false, 'invalid file' end
+			return false, 'invalid file'
 		end
 
 		local success, decoded = pcall(httpService.JSONDecode, httpService, readfile(file))
 		if not success then return false, 'decode error' end
 		if type(decoded) ~= 'table' or type(decoded.objects) ~= 'table' then return false, 'decode error' end
 
-		-- suppress autosave while loading to prevent overwriting with partial state
-		local prevSuppress = Library and Library.SuppressSave
-		if Library then Library.SuppressSave = true end
-		-- use robust loader that directly calls parser (parser does its own lookup + case-insensitive)
+		local lib = self.Library or (getgenv and getgenv().Library) or Library
+		local prevSuppress = lib and lib.SuppressSave
+		if lib then lib.SuppressSave = true end
+
+		-- Group objects to ensure correct initialization dependency order:
+		-- 1. Toggles first so their base states and callbacks configure dependencies
+		-- 2. General options (Sliders, Inputs, Dropdowns, ColorPickers)
+		-- 3. KeyPickers last so synced keybind states overlay correctly
+		local toggles = {}
+		local keypickers = {}
+		local others = {}
+
 		for _, option in next, decoded.objects do
 			if type(option) == 'table' and option.type and self.Parser[option.type] then
-				local optType = option.type
-				local optIdx = option.idx
-				local optData = option
-				if type(optIdx) ~= 'string' then continue end
-				-- always try immediate load, parser handles missing via internal find
-				local ok, err = pcall(function() self.Parser[optType].Load(optIdx, optData) end)
-				if not ok then
-					warn("[SaveManager] Load error for "..tostring(optIdx)..": "..tostring(err))
-				end
-				-- if still not applied, retry for late-created elements
-				-- check if value actually applied
-				task.spawn(function()
-					for _ = 1, 100 do
-						local at = getToggles()
-								local ao = getOptions()
-								t = (ao and ao[optIdx]) or (at and at[optIdx]) or (Options and Options[optIdx]) or (Toggles and Toggles[optIdx])
-							end
-							if t ~= nil then
-								pcall(function() self.Parser[optType].Load(optIdx, optData) end)
-								break
-							end
-							task.wait(0.1)
-						end
-					end)
+				if type(option.idx) == 'string' then
+					if option.type == 'Toggle' then
+						table.insert(toggles, option)
+					elseif option.type == 'KeyPicker' then
+						table.insert(keypickers, option)
+					else
+						table.insert(others, option)
+					end
 				end
 			end
 		end
-		task.spawn(function()
-			task.wait(0.5)
-			local at = getToggles()
-			if at and at["visualize_ammo"] and at["visualize_ammo"].Value then
-				pcall(function() Func["updateammodisplay"]() end)
-			elseif Toggles and Toggles["visualize_ammo"] and Toggles["visualize_ammo"].Value then
-				pcall(function() Func["updateammodisplay"]() end)
-			end
-			pcall(function() if Library and Library.UpdateDependencyBoxes then Library:UpdateDependencyBoxes() end end)
-		end)
+
+		for _, option in ipairs(toggles) do
+			pcall(function() self.Parser.Toggle.Load(option.idx, option) end)
+		end
+
+		for _, option in ipairs(others) do
+			pcall(function() self.Parser[option.type].Load(option.idx, option) end)
+		end
+
+		for _, option in ipairs(keypickers) do
+			pcall(function() self.Parser.KeyPicker.Load(option.idx, option) end)
+		end
+
+		if lib and lib.UpdateDependencyBoxes then
+			pcall(function() lib:UpdateDependencyBoxes() end)
+		end
+
+		if lib then
+			lib.SuppressSave = prevSuppress or false
+		end
+
 		return true
 	end
 
 	function SaveManager:IgnoreThemeSettings()
 		self:SetIgnoreIndexes({ 
-			"BackgroundColor", "MainColor", "AccentColor", "OutlineColor", "FontColor", -- themes
-			"ThemeManager_ThemeList", 'ThemeManager_CustomThemeList', 'ThemeManager_CustomThemeName', -- themes
+			"BackgroundColor", "MainColor", "AccentColor", "OutlineColor", "FontColor",
+			"ThemeManager_ThemeList", 'ThemeManager_CustomThemeList', 'ThemeManager_CustomThemeName',
 		})
 	end
 
@@ -368,23 +383,10 @@ local SaveManager = {} do
 		local out = {}
 		for i = 1, #list do
 			local file = list[i]
-			if type(file) == 'string' and file:sub(-5) == '.json' then
-				local pos = file:find('.json', 1, true)
-				local start = pos
-				local char = file:sub(pos, pos)
-				while char ~= '/' and char ~= '\\' and char ~= '' do
-					pos = pos - 1
-					if pos < 1 then break end
-					char = file:sub(pos, pos)
-				end
-
-				if char == '/' or char == '\\' then
-					table.insert(out, file:sub(pos + 1, start - 1))
-				else
-					-- fallback: file has no directory component
-					local name = file:sub(1, start - 1)
-					-- strip any leading path weirdness
-					name = name:match("([^/\\]+)$") or name
+			if type(file) == 'string' and file:sub(-5):lower() == '.json' then
+				local name = file:gsub('\\', '/')
+				name = name:match("([^/]+)%.json$")
+				if name and name ~= '' then
 					table.insert(out, name)
 				end
 			end
@@ -402,28 +404,35 @@ local SaveManager = {} do
 
 	function SaveManager:LoadAutoloadConfig()
 		task.spawn(function()
-			for _ = 1, 100 do
-				local t = getToggles()
-				local o = getOptions()
-				local hasToggle = (t and t["visualize_ammo"] ~= nil) or (Toggles and Toggles["visualize_ammo"] ~= nil)
-				local hasOpt = (o and o["SaveManager_ConfigList"] ~= nil) or (Options and Options["SaveManager_ConfigList"] ~= nil)
-				if hasToggle and hasOpt then break end
-				task.wait(0.1)
-			end
-			local ok, isFile = pcall(isfile, self.Folder .. '/settings/autoload.txt')
-			if not ok or not isFile then return end
+			local okFile, isFile = pcall(isfile, self.Folder .. '/settings/autoload.txt')
+			if not okFile or not isFile then return end
 			local okRead, name = pcall(readfile, self.Folder .. '/settings/autoload.txt')
 			if not okRead then return end
 			local clean = NormalizeConfigName(name)
 			if not clean then return end
+
+			-- Wait for UI controls to be registered before applying (max 5 seconds)
+			for _ = 1, 50 do
+				local t = getToggles()
+				local o = getOptions()
+				if (t and next(t) ~= nil) or (o and next(o) ~= nil) then
+					break
+				end
+				task.wait(0.1)
+			end
+
 			local success, err = self:Load(clean)
 			if not success then
-				return self.Library:Notify('Failed to load autoload config: ' .. tostring(err))
+				if self.Library then
+					self.Library:Notify('Failed to load autoload config: ' .. tostring(err))
+				end
+				return
 			end
-			self.Library:Notify(string.format('Auto loaded config %q', clean))
+			if self.Library then
+				self.Library:Notify(string.format('Auto loaded config %q', clean))
+			end
 		end)
 	end
-
 
 	function SaveManager:BuildConfigSection(tab)
 		assert(self.Library, 'Must set SaveManager.Library')
@@ -436,7 +445,8 @@ local SaveManager = {} do
 		section:AddDivider()
 
 		section:AddButton('Create config', function()
-			local name = getOptions().SaveManager_ConfigName and getOptions().SaveManager_ConfigName.Value or (Options.SaveManager_ConfigName and Options.SaveManager_ConfigName.Value)
+			local opts = getOptions()
+			local name = (opts.SaveManager_ConfigName and opts.SaveManager_ConfigName.Value) or (Options and Options.SaveManager_ConfigName and Options.SaveManager_ConfigName.Value)
 			local clean = NormalizeConfigName(name)
 
 			if not clean then
@@ -450,17 +460,16 @@ local SaveManager = {} do
 
 			self.Library:Notify(string.format('Created config %q', clean))
 
-			local opts = getOptions()
 			if opts.SaveManager_ConfigList then
 				opts.SaveManager_ConfigList:SetValues(self:RefreshConfigList())
 				opts.SaveManager_ConfigList:SetValue(nil)
-			elseif Options.SaveManager_ConfigList then
+			elseif Options and Options.SaveManager_ConfigList then
 				Options.SaveManager_ConfigList:SetValues(self:RefreshConfigList())
 				Options.SaveManager_ConfigList:SetValue(nil)
 			end
 		end):AddButton('Load config', function()
 			local opts = getOptions()
-			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
+			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options and Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
 
 			local success, err = self:Load(name)
 			if not success then
@@ -472,7 +481,7 @@ local SaveManager = {} do
 
 		section:AddButton('Overwrite config', function()
 			local opts = getOptions()
-			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
+			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options and Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
 
 			local success, err = self:Save(name)
 			if not success then
@@ -484,7 +493,7 @@ local SaveManager = {} do
 
 		section:AddButton('Refresh list', function()
 			local opts = getOptions()
-			local target = opts.SaveManager_ConfigList or Options.SaveManager_ConfigList
+			local target = (opts and opts.SaveManager_ConfigList) or (Options and Options.SaveManager_ConfigList)
 			if target then
 				target:SetValues(self:RefreshConfigList())
 				target:SetValue(nil)
@@ -493,7 +502,7 @@ local SaveManager = {} do
 
 		section:AddButton('Set as autoload', function()
 			local opts = getOptions()
-			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
+			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options and Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
 			local clean = NormalizeConfigName(name)
 			if not clean then
 				return self.Library:Notify('Select a config first', 2)
