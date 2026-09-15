@@ -3,6 +3,17 @@ local httpService = game:GetService('HttpService')
 local SaveManager = {} do
 	SaveManager.Folder = 'LinoriaLibSettings'
 	SaveManager.Ignore = {}
+	SaveManager.AutoloadLabel = nil
+
+	local function NormalizeConfigName(name)
+		if type(name) ~= 'string' then return nil end
+		local clean = name:gsub('%s+', '')
+		if clean:sub(-5):lower() == '.json' then
+			clean = clean:sub(1, -6)
+		end
+		if clean == '' then return nil end
+		return clean
+	end
 	SaveManager.Parser = {
 		Toggle = {
 			Save = function(idx, object) 
@@ -39,18 +50,27 @@ local SaveManager = {} do
 				return { type = 'ColorPicker', idx = idx, value = object.Value:ToHex(), transparency = object.Transparency }
 			end,
 			Load = function(idx, data)
-				if Options[idx] then 
-					Options[idx]:SetValueRGB(Color3.fromHex(data.value), data.transparency)
+				if Options[idx] and type(data.value) == 'string' then
+					local ok, col = pcall(Color3.fromHex, data.value)
+					if ok and typeof(col) == 'Color3' then
+						Options[idx]:SetValueRGB(col, tonumber(data.transparency) or 0)
+					end
 				end
 			end,
 		},
 		KeyPicker = {
 			Save = function(idx, object)
-				return { type = 'KeyPicker', idx = idx, mode = object.Mode, key = object.Value }
+				local mode = object.Mode
+				if type(mode) ~= 'string' then mode = 'Toggle' end
+				local key = object.Value
+				if type(key) ~= 'string' or key == '' then key = 'None' end
+				return { type = 'KeyPicker', idx = idx, mode = mode, key = key }
 			end,
 			Load = function(idx, data)
-				if Options[idx] then 
-					Options[idx]:SetValue({ data.key, data.mode })
+				if Options[idx] and type(data) == 'table' and type(data.key) == 'string' then
+					local mode = data.mode
+					if type(mode) ~= 'string' then mode = 'Toggle' end
+					Options[idx]:SetValue({ data.key, mode })
 				end
 			end,
 		},
@@ -79,11 +99,12 @@ local SaveManager = {} do
 	end
 
 	function SaveManager:Save(name)
-		if (not name) then
+		local clean = NormalizeConfigName(name)
+		if (not clean) then
 			return false, 'no config file is selected'
 		end
 
-		local fullPath = self.Folder .. '/settings/' .. name .. '.json'
+		local fullPath = self.Folder .. '/settings/' .. clean .. '.json'
 
 		local data = {
 			objects = {}
@@ -112,19 +133,39 @@ local SaveManager = {} do
 	end
 
 	function SaveManager:Load(name)
-		if (not name) then
+		local clean = NormalizeConfigName(name)
+		if (not clean) then
 			return false, 'no config file is selected'
 		end
-		
-		local file = self.Folder .. '/settings/' .. name .. '.json'
+
+		local file = self.Folder .. '/settings/' .. clean .. '.json'
 		if not isfile(file) then return false, 'invalid file' end
 
 		local success, decoded = pcall(httpService.JSONDecode, httpService, readfile(file))
 		if not success then return false, 'decode error' end
+		if type(decoded) ~= 'table' or type(decoded.objects) ~= 'table' then return false, 'decode error' end
 
 		for _, option in next, decoded.objects do
-			if self.Parser[option.type] then
-				task.spawn(function() self.Parser[option.type].Load(option.idx, option) end) -- task.spawn() so the config loading wont get stuck.
+			if type(option) == 'table' and self.Parser[option.type] then
+				local optType = option.type
+				local optIdx = option.idx
+				local optData = option
+				task.spawn(function()
+					for _ = 1, 50 do
+						local target = nil
+						if optType == 'Toggle' then
+							target = Toggles[optIdx]
+						else
+							target = Options[optIdx]
+						end
+						if target ~= nil then
+							pcall(function() self.Parser[optType].Load(optIdx, optData) end)
+							break
+						end
+						task.wait(0.1)
+					end
+					pcall(function() self.Parser[optType].Load(optIdx, optData) end)
+				end)
 			end
 		end
 
@@ -147,14 +188,16 @@ local SaveManager = {} do
 
 		for i = 1, #paths do
 			local str = paths[i]
-			if not isfolder(str) then
-				makefolder(str)
+			local ok, isDir = pcall(isfolder, str)
+			if ok and not isDir then
+				pcall(makefolder, str)
 			end
 		end
 	end
 
 	function SaveManager:RefreshConfigList()
-		local list = listfiles(self.Folder .. '/settings')
+		local ok, list = pcall(listfiles, self.Folder .. '/settings')
+		if not ok or type(list) ~= 'table' then return {} end
 
 		local out = {}
 		for i = 1, #list do
@@ -182,19 +225,21 @@ local SaveManager = {} do
 
 	function SaveManager:SetLibrary(library)
 		self.Library = library
+		library.SaveManager = self
 	end
 
 	function SaveManager:LoadAutoloadConfig()
-		if isfile(self.Folder .. '/settings/autoload.txt') then
-			local name = readfile(self.Folder .. '/settings/autoload.txt')
-
-			local success, err = self:Load(name)
-			if not success then
-				return self.Library:Notify('Failed to load autoload config: ' .. err)
-			end
-
-			self.Library:Notify(string.format('Auto loaded config %q', name))
+		local ok, isFile = pcall(isfile, self.Folder .. '/settings/autoload.txt')
+		if not ok or not isFile then return end
+		local okRead, name = pcall(readfile, self.Folder .. '/settings/autoload.txt')
+		if not okRead then return end
+		local clean = NormalizeConfigName(name)
+		if not clean then return end
+		local success, err = self:Load(clean)
+		if not success then
+			return self.Library:Notify('Failed to load autoload config: ' .. err)
 		end
+		self.Library:Notify(string.format('Auto loaded config %q', clean))
 	end
 
 
@@ -210,17 +255,18 @@ local SaveManager = {} do
 
 		section:AddButton('Create config', function()
 			local name = Options.SaveManager_ConfigName.Value
+			local clean = NormalizeConfigName(name)
 
-			if name:gsub(' ', '') == '' then 
+			if not clean then
 				return self.Library:Notify('Invalid config name (empty)', 2)
 			end
 
-			local success, err = self:Save(name)
+			local success, err = self:Save(clean)
 			if not success then
 				return self.Library:Notify('Failed to save config: ' .. err)
 			end
 
-			self.Library:Notify(string.format('Created config %q', name))
+			self.Library:Notify(string.format('Created config %q', clean))
 
 			Options.SaveManager_ConfigList:SetValues(self:RefreshConfigList())
 			Options.SaveManager_ConfigList:SetValue(nil)
@@ -253,16 +299,26 @@ local SaveManager = {} do
 
 		section:AddButton('Set as autoload', function()
 			local name = Options.SaveManager_ConfigList.Value
-			writefile(self.Folder .. '/settings/autoload.txt', name)
-			SaveManager.AutoloadLabel:SetText('Current autoload config: ' .. name)
-			self.Library:Notify(string.format('Set %q to auto load', name))
+			local clean = NormalizeConfigName(name)
+			if not clean then
+				return self.Library:Notify('Select a config first', 2)
+			end
+			writefile(self.Folder .. '/settings/autoload.txt', clean)
+			SaveManager.AutoloadLabel:SetText('Current autoload config: ' .. clean)
+			self.Library:Notify(string.format('Set %q to auto load', clean))
 		end)
 
 		SaveManager.AutoloadLabel = section:AddLabel('Current autoload config: none', true)
 
-		if isfile(self.Folder .. '/settings/autoload.txt') then
-			local name = readfile(self.Folder .. '/settings/autoload.txt')
-			SaveManager.AutoloadLabel:SetText('Current autoload config: ' .. name)
+		local okFile, isFile = pcall(isfile, self.Folder .. '/settings/autoload.txt')
+		if okFile and isFile then
+			local okRead, name = pcall(readfile, self.Folder .. '/settings/autoload.txt')
+			if okRead then
+				local clean = NormalizeConfigName(name)
+				if clean then
+					SaveManager.AutoloadLabel:SetText('Current autoload config: ' .. clean)
+				end
+			end
 		end
 
 		SaveManager:SetIgnoreIndexes({ 'SaveManager_ConfigList', 'SaveManager_ConfigName' })
