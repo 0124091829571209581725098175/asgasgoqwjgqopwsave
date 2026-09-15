@@ -110,16 +110,18 @@ local SaveManager = {} do
 			objects = {}
 		}
 
-		for idx, toggle in next, Toggles do
+		local allToggles = getgenv and getgenv().Toggles or Toggles
+		local allOptions = getgenv and getgenv().Options or Options
+		for idx, toggle in next, allToggles do
 			if self.Ignore[idx] then continue end
-
-			table.insert(data.objects, self.Parser[toggle.Type].Save(idx, toggle))
+			if toggle and toggle.Type == "Toggle" then
+				table.insert(data.objects, self.Parser[toggle.Type].Save(idx, toggle))
+			end
 		end
 
-		for idx, option in next, Options do
+		for idx, option in next, allOptions do
 			if not self.Parser[option.Type] then continue end
 			if self.Ignore[idx] then continue end
-
 			table.insert(data.objects, self.Parser[option.Type].Save(idx, option))
 		end	
 
@@ -128,7 +130,8 @@ local SaveManager = {} do
 			return false, 'failed to encode data'
 		end
 
-		writefile(fullPath, encoded)
+		local ok, err = pcall(writefile, fullPath, encoded)
+		if not ok then return false, 'writefile failed: '..tostring(err) end
 		return true
 	end
 
@@ -139,12 +142,17 @@ local SaveManager = {} do
 		end
 
 		local file = self.Folder .. '/settings/' .. clean .. '.json'
-		if not isfile(file) then return false, 'invalid file' end
+		if not isfile(file) then
+			local alt = 'PhowgHosted/DaHood/settings/'..clean..'.json'
+			if isfile(alt) then file = alt else return false, 'invalid file' end
+		end
 
 		local success, decoded = pcall(httpService.JSONDecode, httpService, readfile(file))
 		if not success then return false, 'decode error' end
 		if type(decoded) ~= 'table' or type(decoded.objects) ~= 'table' then return false, 'decode error' end
 
+		local allToggles = getgenv and getgenv().Toggles or Toggles
+		local allOptions = getgenv and getgenv().Options or Options
 		for _, option in next, decoded.objects do
 			if type(option) == 'table' and self.Parser[option.type] then
 				local optType = option.type
@@ -152,20 +160,20 @@ local SaveManager = {} do
 				local optData = option
 				local target = nil
 				if optType == 'Toggle' then
-					target = Toggles[optIdx]
+					target = allToggles[optIdx] or allOptions[optIdx]
 				else
-					target = Options[optIdx]
+					target = allOptions[optIdx] or allToggles[optIdx]
 				end
 				if target ~= nil then
 					pcall(function() self.Parser[optType].Load(optIdx, optData) end)
 				else
 					task.spawn(function()
-						for _ = 1, 50 do
+						for _ = 1, 100 do
 							local t = nil
 							if optType == 'Toggle' then
-								t = Toggles[optIdx]
+								t = (getgenv and getgenv().Toggles or Toggles)[optIdx] or (getgenv and getgenv().Options or Options)[optIdx]
 							else
-								t = Options[optIdx]
+								t = (getgenv and getgenv().Options or Options)[optIdx] or (getgenv and getgenv().Toggles or Toggles)[optIdx]
 							end
 							if t ~= nil then
 								pcall(function() self.Parser[optType].Load(optIdx, optData) end)
@@ -177,7 +185,13 @@ local SaveManager = {} do
 				end
 			end
 		end
-
+		task.spawn(function()
+			task.wait(0.5)
+			if allToggles["visualize_ammo"] and allToggles["visualize_ammo"].Value then
+				pcall(function() Func["updateammodisplay"]() end)
+			end
+			pcall(function() if Library and Library.UpdateDependencyBoxes then Library:UpdateDependencyBoxes() end end)
+		end)
 		return true
 	end
 
