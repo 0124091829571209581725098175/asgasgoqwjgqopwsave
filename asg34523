@@ -240,17 +240,23 @@ local SaveManager = {} do
 	end
 
 	function SaveManager:LoadAutoloadConfig()
-		local ok, isFile = pcall(isfile, self.Folder .. '/settings/autoload.txt')
-		if not ok or not isFile then return end
-		local okRead, name = pcall(readfile, self.Folder .. '/settings/autoload.txt')
-		if not okRead then return end
-		local clean = NormalizeConfigName(name)
-		if not clean then return end
-		local success, err = self:Load(clean)
-		if not success then
-			return self.Library:Notify('Failed to load autoload config: ' .. err)
-		end
-		self.Library:Notify(string.format('Auto loaded config %q', clean))
+		task.spawn(function()
+			for _ = 1, 100 do
+				if Toggles["visualize_ammo"] ~= nil and Options["SaveManager_ConfigList"] ~= nil then break end
+				task.wait(0.1)
+			end
+			local ok, isFile = pcall(isfile, self.Folder .. '/settings/autoload.txt')
+			if not ok or not isFile then return end
+			local okRead, name = pcall(readfile, self.Folder .. '/settings/autoload.txt')
+			if not okRead then return end
+			local clean = NormalizeConfigName(name)
+			if not clean then return end
+			local success, err = self:Load(clean)
+			if not success then
+				return self.Library:Notify('Failed to load autoload config: ' .. err)
+			end
+			self.Library:Notify(string.format('Auto loaded config %q', clean))
+		end)
 	end
 
 
