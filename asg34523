@@ -51,7 +51,7 @@ local SaveManager = {} do
 		if clean:sub(-5):lower() == '.json' then
 			clean = clean:sub(1, -6)
 		end
-		if clean == '' then return nil end
+		if clean == '' or #clean > 96 or (clean:find('/',1,true) or clean:find('\\',1,true) or clean:find('[:%c]')) or clean:find('..', 1, true) then return nil end
 		return clean
 	end
 
@@ -136,13 +136,7 @@ local SaveManager = {} do
 					end
 
 					if obj.SetValue then
-						local ok = pcall(function() obj:SetValue(v) end)
-						if not ok then
-							pcall(function()
-								obj.Value = v
-								if obj.Display then obj:Display() end
-							end)
-						end
+						obj:SetValue(v)
 					else
 						obj.Value = v
 						if obj.Display then pcall(function() obj:Display() end) end
@@ -244,6 +238,159 @@ local SaveManager = {} do
 		self:BuildFolderTree()
 	end
 
+    function SaveManager:CaptureCurrent()
+        local data, seen = {schemaVersion = self.SchemaVersion, objects = {}}, {}
+        for _, controls in ipairs({getToggles() or {}, getOptions() or {}}) do
+            for idx, control in pairs(controls) do
+                local parser = type(control) == 'table' and self.Parser[control.Type]
+                if parser and not self.Ignore[idx] and not seen[idx] then
+                    local ok, object = pcall(parser.Save, idx, control)
+                    if ok and object then
+                        local entry = self.Library and self.Library.ControlRegistry and self.Library.ControlRegistry[idx]
+                        object.category = entry and entry.Category or self:GetCategory(idx)
+                        data.objects[#data.objects + 1], seen[idx] = object, true
+                    end
+                end
+            end
+        end
+        table.sort(data.objects, function(a, b) return a.idx < b.idx end)
+        return data
+    end
+    function SaveManager:GetCategory(idx)
+        local registry = self.Library and self.Library.ControlRegistry
+        if registry and registry[idx] and registry[idx].Category then return registry[idx].Category end
+        if idx:find('^shield_') then return 'protection' end
+        if idx:find('^SaveManager_') or idx:find('^ui_') or idx:find('^hud_') or idx:find('^settings_') or idx:find('^performance_') or idx:find('^cosmetic_') then return 'interface' end
+        for _, word in ipairs({'esp', 'crosshair', 'tracer', 'afterimage', 'target_hud', 'china_hat', 'hit_', 'ambient', 'lighting', 'radar', 'offscreen', 'indicator', 'visual'}) do
+            if idx:find(word, 1, true) then return 'visuals' end
+        end
+        for _, word in ipairs({'desync', 'strafe', 'fly', 'void', 'underground', 'speed', 'jump', 'walk', 'noclip', 'flashback'}) do
+            if idx:find(word, 1, true) then return 'movement' end
+        end
+        return 'other'
+    end
+    function SaveManager:ReadConfig(name, backup)
+        local clean = NormalizeConfigName(name)
+        if not clean then return nil, 'select a valid config name' end
+        local file = self.Folder .. '/settings/' .. clean .. '.json' .. (backup and '.bak' or '')
+        local ok, raw = pcall(readfile, file)
+        if not ok then return nil, 'could not read config' end
+        local decoded, data = pcall(httpService.JSONDecode, httpService, raw)
+        if not decoded then return nil, 'invalid JSON' end
+        return self:Migrate(data)
+    end
+    local function equal(a, b)
+        if type(a) ~= type(b) then return false end
+        if type(a) ~= 'table' then return a == b end
+        for k, v in pairs(a) do if not equal(v, b[k]) then return false end end
+        for k in pairs(b) do if a[k] == nil then return false end end
+        return true
+    end
+    function SaveManager:Compare(name)
+        local data, err = self:ReadConfig(name)
+        if not data then return nil, err end
+        local current, changes = {}, {}
+        for _, object in ipairs(self:CaptureCurrent().objects) do current[object.idx] = object end
+        for _, object in ipairs(data.objects) do
+            local old = current[object.idx]
+            if not old then changes[#changes + 1] = object.idx .. ': missing or ignored'
+            else
+                local a, b = table.clone(old), table.clone(object)
+                a.category, b.category = nil, nil
+                if not equal(a, b) then
+                    local function value(o)
+                        local v = o.key and (o.key .. ' (' .. tostring(o.mode) .. ')') or o.text or o.value
+                        if type(v) == 'table' then return httpService:JSONEncode(v) end
+                        return tostring(v)
+                    end
+                    changes[#changes + 1] = object.idx .. ': ' .. value(old) .. ' -> ' .. value(object)
+                end
+            end
+        end
+        table.sort(changes)
+        return changes
+    end
+    function SaveManager:Export(name)
+        local data, err
+        if name then data, err = self:ReadConfig(name) else data = self:CaptureCurrent() end
+        if not data then return nil, err end
+        local ok, raw = pcall(httpService.JSONEncode, httpService, data)
+        if not ok then return nil, 'could not encode config' end
+        return raw
+    end
+    function SaveManager:Import(name, raw)
+        local clean = NormalizeConfigName(name)
+        if not clean then return false, 'invalid config name' end
+        local existsOk, exists = pcall(isfile, self.Folder .. '/settings/' .. clean .. '.json')
+        if not existsOk or exists then return false, 'choose a new config name' end
+        local ok, data = pcall(httpService.JSONDecode, httpService, raw)
+        if not ok then return false, 'invalid JSON' end
+        local migrated, err = self:Migrate(data)
+        if not migrated then return false, err end
+        local encodedOk, encoded = pcall(httpService.JSONEncode, httpService, migrated)
+        if not encodedOk then return false, 'could not encode config' end
+        local wrote, problem = pcall(writefile, self.Folder .. '/settings/' .. clean .. '.json', encoded)
+        return wrote, wrote and nil or tostring(problem)
+    end
+    function SaveManager:Rename(oldName, newName)
+        local old, new = NormalizeConfigName(oldName), NormalizeConfigName(newName)
+        if not old or not new or old == new then return false, 'choose two different valid names' end
+        local raw, err = self:Export(old)
+        if not raw then return false, err end
+        local ok, problem = self:Import(new, raw)
+        if not ok then return false, problem end
+        local removed, removeError = pcall(delfile, self.Folder .. '/settings/' .. old .. '.json')
+        if not removed then return false, 'new copy saved; old config could not be removed: ' .. tostring(removeError) end
+        local path = self.Folder .. '/settings/autoload.txt'
+        local got, autoload = pcall(readfile, path)
+        if got and NormalizeConfigName(autoload) == old then
+            local updated, updateError = pcall(writefile, path, new)
+            if not updated then return false, 'renamed; update autoload: ' .. tostring(updateError) end
+            if self.AutoloadLabel then self.AutoloadLabel:SetText('Current autoload config: ' .. new) end
+        end
+        if self.CurrentConfig == old then self.CurrentConfig = new end
+        self:UpdateStatus()
+        return true
+    end
+    function SaveManager:UpdateStatus()
+        if not self.StatusLabel then return end
+        local dirty = self.Library and self.Library.ConfigDirty
+        local saved = self.LastSavedAt and os.date('%H:%M:%S', self.LastSavedAt) or 'never'
+        local text = tostring(self.CurrentConfig or 'no config') .. ' | ' .. (dirty and 'unsaved changes' or 'saved') .. '\nlast save: ' .. saved
+        local r = self.LastLoadReport
+        if r then text ..= string.format('\nloaded %d | missing %d | ignored %d | skipped %d | failed %d', r.Loaded, r.Missing, r.Ignored, r.Skipped, r.Failed) end
+        self.StatusLabel:SetText(text)
+    end
+    function SaveManager:CheckPersistence()
+        local failures, count, encoded = {}, 0, self:CaptureCurrent()
+        local seen = {}
+        for _, object in ipairs(encoded.objects) do seen[object.idx] = object end
+        for _, controls in ipairs({getToggles() or {}, getOptions() or {}}) do
+            for idx, control in pairs(controls) do
+                if type(control) == 'table' and not self.Ignore[idx] then
+                    count += 1
+                    if not self.Parser[control.Type] then failures[#failures + 1] = idx .. ': unsupported type'
+                    elseif not seen[idx] then failures[#failures + 1] = idx .. ': serialization failed'
+                    elseif control.Type == 'KeyPicker' and (type(seen[idx].key) ~= 'string' or seen[idx].mode ~= control.Mode or not table.find({'Always','Hold','Toggle'},seen[idx].mode)) then failures[#failures + 1] = idx .. ': keybind mismatch'
+                    elseif control.Type == 'Slider' then
+                        local value = tonumber(seen[idx].value)
+                        if not value or value ~= value or math.abs(value) == math.huge then failures[#failures + 1] = idx .. ': invalid number' end
+                    elseif control.Type == 'ColorPicker' then
+                        local object = seen[idx]
+                        if type(object.value) ~= 'string' or not object.value:match('^%x%x%x%x%x%x$') then failures[#failures + 1] = idx .. ': invalid color' end
+                        local alpha = object.transparency
+                        if alpha ~= nil and (type(alpha) ~= 'number' or alpha ~= alpha or alpha < 0 or alpha > 1) then failures[#failures + 1] = idx .. ': invalid transparency' end
+                    elseif control.Type == 'Input' and type(seen[idx].text) ~= 'string' then failures[#failures + 1] = idx .. ': invalid text' end
+                end
+            end
+        end
+        local ok, raw = pcall(httpService.JSONEncode, httpService, encoded)
+        local decodedOk, decoded = false, nil
+        if ok then decodedOk, decoded = pcall(httpService.JSONDecode, httpService, raw) end
+        if not decodedOk or not equal(encoded, decoded) then failures[#failures + 1] = 'JSON round trip changed settings' end
+        return #failures == 0, count, failures
+    end
+
 	function SaveManager:Save(name)
 		local clean = NormalizeConfigName(name)
 		if (not clean) then
@@ -252,66 +399,7 @@ local SaveManager = {} do
 
 		local fullPath = self.Folder .. '/settings/' .. clean .. '.json'
 
-		local data = {
-			schemaVersion = self.SchemaVersion,
-			objects = {}
-		}
-
-		local allToggles = getToggles()
-		local allOptions = getOptions()
-
-		if allToggles then
-			for idx, toggle in next, allToggles do
-				if self.Ignore[idx] then continue end
-				if toggle and type(toggle) == 'table' then
-					local typ = toggle.Type
-					if typ == "Toggle" or (typ == nil and type(toggle.Value) == 'boolean' and toggle.SetValue) then
-						typ = "Toggle"
-					end
-					if typ and self.Parser[typ] then
-						local ok, result = pcall(self.Parser[typ].Save, idx, toggle)
-						if ok and result then
-							table.insert(data.objects, result)
-						end
-					end
-				end
-			end
-		end
-
-		if allOptions then
-			for idx, option in next, allOptions do
-				if self.Ignore[idx] then continue end
-				if option and type(option) == 'table' and option.Type then
-					if self.Parser[option.Type] then
-						local ok, result = pcall(self.Parser[option.Type].Save, idx, option)
-						if ok and result then
-							table.insert(data.objects, result)
-						end
-					end
-				end
-			end
-		end
-
-		-- Check fallback tables in case of environment divergence
-		if Toggles and Toggles ~= allToggles then
-			for idx, toggle in next, Toggles do
-				if self.Ignore[idx] then continue end
-				if toggle and toggle.Type == "Toggle" and not (allToggles and allToggles[idx]) then
-					local ok, result = pcall(self.Parser.Toggle.Save, idx, toggle)
-					if ok and result then table.insert(data.objects, result) end
-				end
-			end
-		end
-
-		if Options and Options ~= allOptions then
-			for idx, option in next, Options do
-				if self.Ignore[idx] then continue end
-				if option and option.Type and self.Parser[option.Type] and not (allOptions and allOptions[idx]) then
-					local ok, result = pcall(self.Parser[option.Type].Save, idx, option)
-					if ok and result then table.insert(data.objects, result) end
-				end
-			end
-		end
+		local data = self:CaptureCurrent()
 
 		local success, encoded = pcall(httpService.JSONEncode, httpService, data)
 		if not success then
@@ -342,10 +430,13 @@ local SaveManager = {} do
 			end
 			return false, 'writefile failed: '..tostring(err)
 		end
+		self.LastSavedAt, self.CurrentConfig = os.time(), clean
+		if self.Library then self.Library.ConfigDirty = false end
+		self:UpdateStatus()
 		return true
 	end
 
-	function SaveManager:Load(name, fromBackup)
+	function SaveManager:Load(name, fromBackup, categories)
 		local clean = NormalizeConfigName(name)
 		if (not clean) then
 			return false, 'no config file is selected'
@@ -367,6 +458,9 @@ local SaveManager = {} do
 		if not migrated then return false, migrationError end
 		decoded = migrated
 
+        return self:ApplyConfig(decoded, clean, categories)
+    end
+    function SaveManager:ApplyConfig(decoded, name, categories)
 		if self.Loading then return false, 'a config is already loading' end
 		local lib = self.Library or (getgenv and getgenv().Library) or Library
 		if lib and lib.Unloaded then return false, 'the library is unloaded' end
@@ -387,10 +481,34 @@ local SaveManager = {} do
 			if updateDependencies then lib.UpdateDependencyBoxes = function() end end
 		end
 		if lib and lib.BeforeConfigLoad then pcall(lib.BeforeConfigLoad) end
-		local toggles, keypickers, others, protection = {}, {}, {}, {}
+        local report = {Loaded = 0, Missing = 0, Ignored = 0, Skipped = 0, Failed = 0, Details = {}}
+        self.LastLoadReport = report
+        local controls, options, applied = getToggles() or {}, getOptions() or {}, {}
+        local function reject(kind, idx, reason)
+            report[kind] += 1
+            report.Details[#report.Details + 1] = tostring(idx) .. ': ' .. reason
+        end
+        local function allowed(option)
+            local idx = option.idx
+            if type(idx) ~= 'string' or not self.Parser[option.type] then reject('Failed', idx, 'unsupported or invalid entry'); return false end
+            if self.Ignore[idx] then reject('Ignored', idx, 'excluded from persistence'); return false end
+            local control = controls[idx] or options[idx]
+            if not control then reject('Missing', idx, 'control does not exist'); return false end
+            if control.Type and control.Type ~= option.type then reject('Failed', idx, 'control type mismatch'); return false end
+            local category = self:GetCategory(idx)
+            if categories and next(categories) and not categories[category] and not table.find(categories, category) then reject('Skipped', idx, 'category not selected'); return false end
+            if option.type == 'Slider' and (not tonumber(option.value) or tonumber(option.value) ~= tonumber(option.value) or math.abs(tonumber(option.value)) == math.huge) then reject('Failed', idx, 'invalid numeric value'); return false end
+            if option.type == 'ColorPicker' and (type(option.value) ~= 'string' or not option.value:match('^%x%x%x%x%x%x$')) then reject('Failed', idx, 'invalid color'); return false end
+            if option.type == 'KeyPicker' and (type(option.key) ~= 'string' or not table.find({'Always','Toggle','Hold'}, option.mode or 'Toggle')) then reject('Failed', idx, 'invalid keybind'); return false end
+            if option.type == 'Input' and type(option.text) ~= 'string' then reject('Failed', idx, 'invalid text'); return false end
+            if applied[idx] then reject('Skipped', idx, 'duplicate control entry'); return false end
+            applied[idx] = true
+            return true
+        end
+        local toggles, keypickers, others, protection = {}, {}, {}, {}
 		local protectionMaster = nil
 		for _, option in next, decoded.objects do
-			if type(option) == 'table' and type(option.idx) == 'string' and self.Parser[option.type] then
+			if type(option) == 'table' and allowed(option) then
 				if option.idx == 'shield_enable' then protectionMaster = option
 				elseif option.idx:sub(1, 7) == 'shield_' then table.insert(protection, option)
 				elseif option.type == 'Toggle' then table.insert(toggles, option)
@@ -400,7 +518,7 @@ local SaveManager = {} do
 		end
 		local function apply(option)
 			local ok, err = pcall(self.Parser[option.type].Load, option.idx, option)
-			if not ok then errors[#errors + 1] = option.idx .. ': ' .. tostring(err) end
+			if not ok then errors[#errors + 1] = option.idx .. ': ' .. tostring(err); reject('Failed', option.idx, tostring(err)) else report.Loaded += 1 end
 		end
 		for _, option in ipairs(protection) do apply(option) end
 		if protectionMaster then apply(protectionMaster) end
@@ -432,7 +550,11 @@ local SaveManager = {} do
 			if lib.AfterConfigLoad then pcall(lib.AfterConfigLoad) end
 		end
 		self.Loading = false
+        self.CurrentConfig = name or self.CurrentConfig
+        if lib then lib.ConfigDirty = (categories and next(categories) ~= nil) or report.Failed > 0 or report.Missing > 0 end
+        self:UpdateStatus()
 		if #errors > 0 then return false, 'failed to load ' .. table.concat(errors, '; ') end
+        if report.Failed > 0 then return false, tostring(report.Failed) .. ' invalid config entries; see load report' end
 
 		return true
 	end
@@ -560,7 +682,8 @@ local SaveManager = {} do
 			local opts = getOptions()
 			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options and Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
 
-			local success, err = self:Load(name)
+			local selected = opts.SaveManager_Categories and opts.SaveManager_Categories.Value
+            local success, err = self:Load(name, false, selected)
 			if not success then
 				return self.Library:Notify('Failed to load config: ' .. tostring(err))
 			end
@@ -612,6 +735,42 @@ local SaveManager = {} do
 			self.Library:Notify(string.format('Set %q to auto load', clean))
 			return nil
 		end)
+
+        section:AddDropdown('SaveManager_Categories', {Text = 'load categories (empty = all)', Values = {'visuals','movement','protection','interface','other'}, Multi = true, AllowNull = true})
+        section:AddInput('SaveManager_ImportText', {Text = 'import JSON', Finished = true})
+        self.StatusLabel = section:AddLabel('no config | last save: never', true)
+        self.DetailLabel = section:AddLabel('', true)
+        section:AddButton('Compare selected config', function()
+            local opts = getOptions()
+            local changes, err = self:Compare(opts.SaveManager_ConfigList.Value)
+            self.DetailLabel:SetText(changes and (#changes .. ' differences\n' .. table.concat(changes, '\n')) or tostring(err))
+        end)
+        section:AddButton('Show load report', function()
+            self.DetailLabel:SetText(self.LastLoadReport and table.concat(self.LastLoadReport.Details, '\n') or 'No config loaded yet')
+        end)
+        section:AddButton('Export selected config', function()
+            local raw, err = self:Export(getOptions().SaveManager_ConfigList.Value)
+            if raw and setclipboard then local ok = pcall(setclipboard, raw); self.Library:Notify(ok and 'Config copied' or 'Clipboard unavailable')
+            else self.Library:Notify(err or 'Clipboard unavailable') end
+        end)
+        section:AddButton('Import as new config', function()
+            local opts = getOptions()
+            local ok, err = self:Import(opts.SaveManager_ConfigName.Value, opts.SaveManager_ImportText.Value)
+            self.Library:Notify(ok and 'Config imported' or tostring(err))
+            if ok then opts.SaveManager_ConfigList:SetValues(self:RefreshConfigList()) end
+        end)
+        section:AddButton('Rename selected config', function()
+            local opts = getOptions()
+            local ok, err = self:Rename(opts.SaveManager_ConfigList.Value, opts.SaveManager_ConfigName.Value)
+            self.Library:Notify(ok and 'Config renamed' or tostring(err))
+            if ok then opts.SaveManager_ConfigList:SetValues(self:RefreshConfigList()); opts.SaveManager_ConfigList:SetValue(nil) end
+        end)
+        section:AddButton('Check setting persistence', function()
+            local ok, count, failures = self:CheckPersistence()
+            self.DetailLabel:SetText(ok and (count .. ' controls serialize correctly') or table.concat(failures, '\n'))
+        end)
+        self:SetIgnoreIndexes({'SaveManager_Categories','SaveManager_ImportText'})
+        self:UpdateStatus()
 
 		SaveManager.AutoloadLabel = section:AddLabel('Current autoload config: none', true)
 
