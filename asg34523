@@ -368,21 +368,23 @@ local SaveManager = {} do
 		decoded = migrated
 
 		local lib = self.Library or (getgenv and getgenv().Library) or Library
+		if lib and lib.BeforeConfigLoad then pcall(lib.BeforeConfigLoad) end
 		local prevSuppress = lib and lib.SuppressSave
 		if lib then lib.SuppressSave = true end
-
-		-- Group objects to ensure correct initialization dependency order:
-		-- 1. Toggles first so their base states and callbacks configure dependencies
-		-- 2. General options (Sliders, Inputs, Dropdowns, ColorPickers)
-		-- 3. KeyPickers last so synced keybind states overlay correctly
 		local toggles = {}
 		local keypickers = {}
 		local others = {}
+		local protection = {}
+		local protectionMaster = nil
 
 		for _, option in next, decoded.objects do
 			if type(option) == 'table' and option.type and self.Parser[option.type] then
 				if type(option.idx) == 'string' then
-					if option.type == 'Toggle' then
+					if option.idx == 'shield_enable' then
+						protectionMaster = option
+					elseif option.idx:sub(1, 7) == 'shield_' then
+						table.insert(protection, option)
+					elseif option.type == 'Toggle' then
 						table.insert(toggles, option)
 					elseif option.type == 'KeyPicker' then
 						table.insert(keypickers, option)
@@ -393,16 +395,24 @@ local SaveManager = {} do
 			end
 		end
 
-		for _, option in ipairs(toggles) do
-			pcall(function() self.Parser.Toggle.Load(option.idx, option) end)
-		end
-
-		for _, option in ipairs(others) do
+		for _, option in ipairs(protection) do
 			pcall(function() self.Parser[option.type].Load(option.idx, option) end)
 		end
-
-		for _, option in ipairs(keypickers) do
-			pcall(function() self.Parser.KeyPicker.Load(option.idx, option) end)
+		if protectionMaster then
+			pcall(function() self.Parser[protectionMaster.type].Load(protectionMaster.idx, protectionMaster) end)
+		end
+		if lib and lib.AfterProtectionConfigLoad then pcall(lib.AfterProtectionConfigLoad) end
+		local budgetAt, count = os.clock(), 0
+		for _, group in ipairs({toggles, others, keypickers}) do
+			for _, option in ipairs(group) do
+				if lib and lib.Unloaded then break end
+				pcall(function() self.Parser[option.type].Load(option.idx, option) end)
+				count += 1
+				if count >= 16 or os.clock() - budgetAt >= 0.003 then
+					task.wait()
+					budgetAt, count = os.clock(), 0
+				end
+			end
 		end
 
 		if lib and lib.UpdateDependencyBoxes then
@@ -411,6 +421,7 @@ local SaveManager = {} do
 
 		if lib then
 			lib.SuppressSave = prevSuppress or false
+			if lib.AfterConfigLoad then pcall(lib.AfterConfigLoad) end
 		end
 
 		return true
@@ -534,6 +545,7 @@ local SaveManager = {} do
 				Options.SaveManager_ConfigList:SetValues(self:RefreshConfigList())
 				Options.SaveManager_ConfigList:SetValue(nil)
 			end
+			return nil
 		end):AddButton('Load config', function()
 			local opts = getOptions()
 			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options and Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
@@ -544,6 +556,7 @@ local SaveManager = {} do
 			end
 
 			self.Library:Notify(string.format('Loaded config %q', tostring(name)))
+			return nil
 		end)
 
 		section:AddButton('Overwrite config', function()
@@ -556,6 +569,7 @@ local SaveManager = {} do
 			end
 
 			self.Library:Notify(string.format('Overwrote config %q', tostring(name)))
+			return nil
 		end)
 
 		section:AddButton('Refresh list', function()
@@ -586,6 +600,7 @@ local SaveManager = {} do
 				SaveManager.AutoloadLabel:SetText('Current autoload config: ' .. clean)
 			end
 			self.Library:Notify(string.format('Set %q to auto load', clean))
+			return nil
 		end)
 
 		SaveManager.AutoloadLabel = section:AddLabel('Current autoload config: none', true)
