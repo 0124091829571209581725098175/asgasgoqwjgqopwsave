@@ -166,7 +166,7 @@ local SaveManager = {} do
 				if obj and obj.SetValue then
 					local v = tonumber(data.value) or data.value
 					if v ~= nil then
-						pcall(function() obj:SetValue(v) end)
+						obj:SetValue(v)
 					end
 				end
 			end,
@@ -179,8 +179,8 @@ local SaveManager = {} do
 				local o = getOptions()
 				local t = getToggles()
 				local obj = (o and o[idx]) or (t and t[idx]) or (Options and Options[idx]) or (Toggles and Toggles[idx])
-				if obj and obj.SetValue and data.value ~= nil then
-					pcall(function() obj:SetValue(data.value) end)
+				if obj and obj.SetValue then
+					obj:SetValue(data.value)
 				end
 			end,
 		},
@@ -196,7 +196,7 @@ local SaveManager = {} do
 				if obj and type(data.value) == 'string' then
 					local ok, col = pcall(Color3.fromHex, data.value)
 					if ok and typeof(col) == 'Color3' then
-						pcall(function() obj:SetValueRGB(col, tonumber(data.transparency) or 0) end)
+						obj:SetValueRGB(col, tonumber(data.transparency) or 0)
 					end
 				end
 			end,
@@ -215,7 +215,7 @@ local SaveManager = {} do
 				if obj and type(data) == 'table' and type(data.key) == 'string' then
 					local mode = data.mode
 					if type(mode) ~= 'string' then mode = 'Toggle' end
-					pcall(function() obj:SetValue({ data.key, mode }) end)
+					obj:SetValue({ data.key, mode })
 				end
 			end,
 		},
@@ -227,7 +227,7 @@ local SaveManager = {} do
 				local o = getOptions()
 				local obj = (o and o[idx]) or (Options and Options[idx])
 				if obj and type(data.text) == 'string' then
-					pcall(function() obj:SetValue(data.text) end)
+					obj:SetValue(data.text)
 				end
 			end,
 		},
@@ -367,62 +367,72 @@ local SaveManager = {} do
 		if not migrated then return false, migrationError end
 		decoded = migrated
 
+		if self.Loading then return false, 'a config is already loading' end
 		local lib = self.Library or (getgenv and getgenv().Library) or Library
-		if lib and lib.BeforeConfigLoad then pcall(lib.BeforeConfigLoad) end
+		if lib and lib.Unloaded then return false, 'the library is unloaded' end
+		self.Loading = true
 		local prevSuppress = lib and lib.SuppressSave
-		if lib then lib.SuppressSave = true end
-		local toggles = {}
-		local keypickers = {}
-		local others = {}
-		local protection = {}
+		local prevLoading = lib and lib.ConfigLoading
+		local safeCallback = lib and lib.SafeCallback
+		local updateDependencies = lib and lib.UpdateDependencyBoxes
+		local callbacks, errors = {}, {}
+		if lib then
+			lib.SuppressSave = true
+			lib.ConfigLoading = true
+			if safeCallback then
+				lib.SafeCallback = function(_, callback, ...)
+					if callback then callbacks[#callbacks + 1] = {Callback = callback, Arguments = table.pack(...)} end
+				end
+			end
+			if updateDependencies then lib.UpdateDependencyBoxes = function() end end
+		end
+		if lib and lib.BeforeConfigLoad then pcall(lib.BeforeConfigLoad) end
+		local toggles, keypickers, others, protection = {}, {}, {}, {}
 		local protectionMaster = nil
-
 		for _, option in next, decoded.objects do
-			if type(option) == 'table' and option.type and self.Parser[option.type] then
-				if type(option.idx) == 'string' then
-					if option.idx == 'shield_enable' then
-						protectionMaster = option
-					elseif option.idx:sub(1, 7) == 'shield_' then
-						table.insert(protection, option)
-					elseif option.type == 'Toggle' then
-						table.insert(toggles, option)
-					elseif option.type == 'KeyPicker' then
-						table.insert(keypickers, option)
-					else
-						table.insert(others, option)
-					end
-				end
+			if type(option) == 'table' and type(option.idx) == 'string' and self.Parser[option.type] then
+				if option.idx == 'shield_enable' then protectionMaster = option
+				elseif option.idx:sub(1, 7) == 'shield_' then table.insert(protection, option)
+				elseif option.type == 'Toggle' then table.insert(toggles, option)
+				elseif option.type == 'KeyPicker' then table.insert(keypickers, option)
+				else table.insert(others, option) end
 			end
 		end
-
-		for _, option in ipairs(protection) do
-			pcall(function() self.Parser[option.type].Load(option.idx, option) end)
+		local function apply(option)
+			local ok, err = pcall(self.Parser[option.type].Load, option.idx, option)
+			if not ok then errors[#errors + 1] = option.idx .. ': ' .. tostring(err) end
 		end
-		if protectionMaster then
-			pcall(function() self.Parser[protectionMaster.type].Load(protectionMaster.idx, protectionMaster) end)
+		for _, option in ipairs(protection) do apply(option) end
+		if protectionMaster then apply(protectionMaster) end
+		local protectionCallbacks = #callbacks
+		for _, group in ipairs({others, keypickers, toggles}) do
+			for _, option in ipairs(group) do apply(option) end
 		end
+		if lib then
+			lib.SafeCallback = safeCallback
+			lib.UpdateDependencyBoxes = updateDependencies
+		end
+		local function dispatch(entry)
+			task.spawn(function()
+				if lib and lib.Unloaded then return end
+				local ok, err = pcall(safeCallback, lib, entry.Callback, table.unpack(entry.Arguments, 1, entry.Arguments.n))
+				if not ok then
+					warn('[Phowg] config callback: ' .. tostring(err))
+					if lib and lib.Notify then pcall(lib.Notify, lib, 'Config callback failed: ' .. tostring(err)) end
+				end
+			end)
+		end
+		for index = 1, protectionCallbacks do dispatch(callbacks[index]) end
 		if lib and lib.AfterProtectionConfigLoad then pcall(lib.AfterProtectionConfigLoad) end
-		local budgetAt, count = os.clock(), 0
-		for _, group in ipairs({toggles, others, keypickers}) do
-			for _, option in ipairs(group) do
-				if lib and lib.Unloaded then break end
-				pcall(function() self.Parser[option.type].Load(option.idx, option) end)
-				count += 1
-				if count >= 16 or os.clock() - budgetAt >= 0.003 then
-					task.wait()
-					budgetAt, count = os.clock(), 0
-				end
-			end
-		end
-
-		if lib and lib.UpdateDependencyBoxes then
-			pcall(function() lib:UpdateDependencyBoxes() end)
-		end
-
+		for index = protectionCallbacks + 1, #callbacks do dispatch(callbacks[index]) end
+		if updateDependencies then pcall(updateDependencies, lib) end
 		if lib then
 			lib.SuppressSave = prevSuppress or false
+			lib.ConfigLoading = prevLoading or false
 			if lib.AfterConfigLoad then pcall(lib.AfterConfigLoad) end
 		end
+		self.Loading = false
+		if #errors > 0 then return false, 'failed to load ' .. table.concat(errors, '; ') end
 
 		return true
 	end
