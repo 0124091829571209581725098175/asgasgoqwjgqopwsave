@@ -5,6 +5,45 @@ local SaveManager = {} do
 	SaveManager.Ignore = {}
 	SaveManager.AutoloadLabel = nil
 	SaveManager.Library = nil
+	SaveManager.SchemaVersion = 1
+	SaveManager.IndexAliases = {}
+	SaveManager.Migrations = {
+		[0] = function(data)
+			data.schemaVersion = 1
+			return data
+		end
+	}
+	function SaveManager:SetIndexAliases(aliases)
+		for oldIndex, newIndex in pairs(aliases) do
+			if type(oldIndex) == 'string' and type(newIndex) == 'string' then self.IndexAliases[oldIndex] = newIndex end
+		end
+	end
+	function SaveManager:Migrate(data)
+		if type(data) ~= 'table' or type(data.objects) ~= 'table' then return nil, 'invalid config data' end
+		local version = data.schemaVersion
+		if version == nil then version = 0 end
+		if type(version) ~= 'number' or version < 0 or version % 1 ~= 0 then return nil, 'invalid schema version' end
+		if version > self.SchemaVersion then return nil, 'config requires a newer script version' end
+		data = table.clone(data)
+		while version < self.SchemaVersion do
+			local migration = self.Migrations[version]
+			if not migration then return nil, 'missing config migration' end
+			local ok, result = pcall(migration, data)
+			if not ok or type(result) ~= 'table' or result.schemaVersion ~= version + 1 or type(result.objects) ~= 'table' then return nil, 'config migration failed' end
+			data = result
+			version += 1
+		end
+		local objects = {}
+		for _, object in pairs(data.objects) do
+			if type(object) == 'table' then
+				local copy = table.clone(object)
+				if type(copy.idx) == 'string' then copy.idx = self.IndexAliases[copy.idx] or copy.idx end
+				table.insert(objects, copy)
+			end
+		end
+		data.objects = objects
+		return data
+	end
 
 	local function NormalizeConfigName(name)
 		if type(name) ~= 'string' then return nil end
@@ -214,6 +253,7 @@ local SaveManager = {} do
 		local fullPath = self.Folder .. '/settings/' .. clean .. '.json'
 
 		local data = {
+			schemaVersion = self.SchemaVersion,
 			objects = {}
 		}
 
@@ -278,27 +318,54 @@ local SaveManager = {} do
 			return false, 'failed to encode data'
 		end
 
-		pcall(function() self:BuildFolderTree() end)
+		local folderOk, folderError = pcall(function() self:BuildFolderTree() end)
+		if not folderOk then return false, 'folder creation failed: ' .. tostring(folderError) end
+		local existsOk, exists = pcall(isfile, fullPath)
+		if not existsOk then return false, 'failed to check existing config' end
+		local previous
+		if exists then
+			local readOk, raw = pcall(readfile, fullPath)
+			if not readOk then return false, 'failed to read existing config' end
+			previous = raw
+			local decodeOk, oldData = pcall(httpService.JSONDecode, httpService, raw)
+			if decodeOk and type(oldData) == 'table' and type(oldData.objects) == 'table' then
+				local backupOk, backupError = pcall(writefile, fullPath .. '.bak', raw)
+				if not backupOk then return false, 'backup failed: ' .. tostring(backupError) end
+			end
+		end
 
 		local ok, err = pcall(writefile, fullPath, encoded)
-		if not ok then return false, 'writefile failed: '..tostring(err) end
+		if not ok then
+			if previous then
+				local restored = pcall(writefile, fullPath, previous)
+				if not restored then return false, 'write failed; restore the .json.bak file before saving again' end
+			end
+			return false, 'writefile failed: '..tostring(err)
+		end
 		return true
 	end
 
-	function SaveManager:Load(name)
+	function SaveManager:Load(name, fromBackup)
 		local clean = NormalizeConfigName(name)
 		if (not clean) then
 			return false, 'no config file is selected'
 		end
 
 		local file = self.Folder .. '/settings/' .. clean .. '.json'
-		if not isfile(file) then
+		if fromBackup then file ..= '.bak' end
+		local existsOk, exists = pcall(isfile, file)
+		if not existsOk or not exists then
 			return false, 'invalid file'
 		end
 
-		local success, decoded = pcall(httpService.JSONDecode, httpService, readfile(file))
+		local readOk, raw = pcall(readfile, file)
+		if not readOk then return false, 'read error' end
+		local success, decoded = pcall(httpService.JSONDecode, httpService, raw)
 		if not success then return false, 'decode error' end
 		if type(decoded) ~= 'table' or type(decoded.objects) ~= 'table' then return false, 'decode error' end
+		local migrated, migrationError = self:Migrate(decoded)
+		if not migrated then return false, migrationError end
+		decoded = migrated
 
 		local lib = self.Library or (getgenv and getgenv().Library) or Library
 		local prevSuppress = lib and lib.SuppressSave
@@ -498,6 +565,13 @@ local SaveManager = {} do
 				target:SetValues(self:RefreshConfigList())
 				target:SetValue(nil)
 			end
+		end)
+		section:AddButton('Load previous save', function()
+			local opts = getOptions()
+			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options and Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
+			local success, err = self:Load(name, true)
+			if not success then self.Library:Notify('Failed to load backup: ' .. tostring(err)); return end
+			self.Library:Notify('Loaded previous save. Use Overwrite config to keep it.')
 		end)
 
 		section:AddButton('Set as autoload', function()
