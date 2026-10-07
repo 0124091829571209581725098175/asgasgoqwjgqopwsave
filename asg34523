@@ -5,6 +5,7 @@ local SaveManager = {} do
 	SaveManager.Ignore = {}
 	SaveManager.AutoloadLabel = nil
 	SaveManager.Library = nil
+	SaveManager.PhowgRevision = 3
 	SaveManager.SchemaVersion = 1
 	SaveManager.IndexAliases = {}
 	SaveManager.Migrations = {
@@ -89,6 +90,24 @@ local SaveManager = {} do
 		return (SaveManager.Library and SaveManager.Library.Options) or Options
 	end
 
+	local function getControls()
+		local controls = {}
+		for _, source in ipairs({getToggles() or {}, getOptions() or {}}) do
+			for idx, control in pairs(source) do
+				if type(idx) == 'string' and type(control) == 'table' then controls[idx] = control end
+			end
+		end
+		local registry = SaveManager.Library and SaveManager.Library.ControlRegistry
+		for idx, entry in pairs(registry or {}) do
+			if type(idx) == 'string' and type(entry.Control) == 'table' then controls[idx] = entry.Control end
+		end
+		return controls
+	end
+	local function findControl(idx)
+		local registry = SaveManager.Library and SaveManager.Library.ControlRegistry
+		local entry = registry and registry[idx]
+		return (entry and entry.Control) or (getToggles() or {})[idx] or (getOptions() or {})[idx]
+	end
 	SaveManager.Parser = {
 		Toggle = {
 			Save = function(idx, object) 
@@ -122,6 +141,7 @@ local SaveManager = {} do
 				end
 
 				local obj = findToggle(idx)
+				obj = findControl(idx) or obj
 				if obj then
 					local v = data.value
 					if type(v) == "string" then
@@ -154,9 +174,7 @@ local SaveManager = {} do
 				return { type = 'Slider', idx = idx, value = tostring(object.Value) }
 			end,
 			Load = function(idx, data)
-				local o = getOptions()
-				local t = getToggles()
-				local obj = (o and o[idx]) or (t and t[idx]) or (Options and Options[idx]) or (Toggles and Toggles[idx])
+				local obj = findControl(idx)
 				if obj and obj.SetValue then
 					local v = tonumber(data.value) or data.value
 					if v ~= nil then
@@ -167,12 +185,10 @@ local SaveManager = {} do
 		},
 		Dropdown = {
 			Save = function(idx, object)
-				return { type = 'Dropdown', idx = idx, value = object.Value, multi = object.Multi }
+				return { type = 'Dropdown', idx = idx, value = type(object.Value) == 'table' and table.clone(object.Value) or object.Value, multi = object.Multi }
 			end,
 			Load = function(idx, data)
-				local o = getOptions()
-				local t = getToggles()
-				local obj = (o and o[idx]) or (t and t[idx]) or (Options and Options[idx]) or (Toggles and Toggles[idx])
+				local obj = findControl(idx)
 				if obj and obj.SetValue then
 					obj:SetValue(data.value)
 				end
@@ -180,17 +196,20 @@ local SaveManager = {} do
 		},
 		ColorPicker = {
 			Save = function(idx, object)
-				local hex = ''
-				pcall(function() hex = object.Value:ToHex() end)
-				return { type = 'ColorPicker', idx = idx, value = hex, transparency = object.Transparency }
+				local color = object.RgbEnabled and object.OriginalValue or object.Value
+				return { type = 'ColorPicker', idx = idx, value = color:ToHex(), transparency = object.RgbEnabled and object.OriginalTransparency or object.Transparency, rgb = object.RgbEnabled == true, chromaSpeed = object.ChromaSpeed or 1 }
 			end,
 			Load = function(idx, data)
-				local o = getOptions()
-				local obj = (o and o[idx]) or (Options and Options[idx])
+				local obj = findControl(idx)
 				if obj and type(data.value) == 'string' then
 					local ok, col = pcall(Color3.fromHex, data.value)
 					if ok and typeof(col) == 'Color3' then
+						local library = SaveManager.Library
+						if library and library.SetChromaEnabled then library:SetChromaEnabled(obj, false) end
 						obj:SetValueRGB(col, tonumber(data.transparency) or 0)
+						obj.ChromaSpeed = math.clamp(tonumber(data.chromaSpeed) or 1, 1, 5)
+						if obj.UpdateChromaSpeed then obj.UpdateChromaSpeed() end
+						if library and library.SetChromaEnabled then library:SetChromaEnabled(obj, data.rgb == true) end
 					end
 				end
 			end,
@@ -204,8 +223,7 @@ local SaveManager = {} do
 				return { type = 'KeyPicker', idx = idx, mode = mode, key = key }
 			end,
 			Load = function(idx, data)
-				local o = getOptions()
-				local obj = (o and o[idx]) or (Options and Options[idx])
+				local obj = findControl(idx)
 				if obj and type(data) == 'table' and type(data.key) == 'string' then
 					local mode = data.mode
 					if type(mode) ~= 'string' then mode = 'Toggle' end
@@ -218,8 +236,7 @@ local SaveManager = {} do
 				return { type = 'Input', idx = idx, text = object.Value }
 			end,
 			Load = function(idx, data)
-				local o = getOptions()
-				local obj = (o and o[idx]) or (Options and Options[idx])
+				local obj = findControl(idx)
 				if obj and type(data.text) == 'string' then
 					obj:SetValue(data.text)
 				end
@@ -239,22 +256,24 @@ local SaveManager = {} do
 	end
 
     function SaveManager:CaptureCurrent()
-        local data, seen = {schemaVersion = self.SchemaVersion, objects = {}}, {}
-        for _, controls in ipairs({getToggles() or {}, getOptions() or {}}) do
-            for idx, control in pairs(controls) do
-                local parser = type(control) == 'table' and self.Parser[control.Type]
-                if parser and not self.Ignore[idx] and not seen[idx] then
-                    local ok, object = pcall(parser.Save, idx, control)
-                    if ok and object then
-                        local entry = self.Library and self.Library.ControlRegistry and self.Library.ControlRegistry[idx]
-                        object.category = entry and entry.Category or self:GetCategory(idx)
-                        data.objects[#data.objects + 1], seen[idx] = object, true
-                    end
+        local data, failures = {schemaVersion = self.SchemaVersion, objects = {}}, {}
+        for idx, control in pairs(getControls()) do
+            local parser = type(control) == 'table' and self.Parser[control.Type]
+            if not self.Ignore[idx] then
+                if not parser then failures[#failures + 1] = idx .. ': unsupported control type'; continue end
+                local ok, object = pcall(parser.Save, idx, control)
+                if ok and type(object) == 'table' then
+                    local entry = self.Library and self.Library.ControlRegistry and self.Library.ControlRegistry[idx]
+                    object.category = entry and entry.Category or self:GetCategory(idx)
+                    data.objects[#data.objects + 1] = object
+                else
+                    failures[#failures + 1] = idx .. ': ' .. tostring(object)
                 end
             end
         end
         table.sort(data.objects, function(a, b) return a.idx < b.idx end)
-        return data
+        self.LastSaveFailures = failures
+        return data, failures
     end
     function SaveManager:GetCategory(idx)
         local registry = self.Library and self.Library.ControlRegistry
@@ -312,7 +331,11 @@ local SaveManager = {} do
     end
     function SaveManager:Export(name)
         local data, err
-        if name then data, err = self:ReadConfig(name) else data = self:CaptureCurrent() end
+        if name then data, err = self:ReadConfig(name) else
+            local failures
+            data, failures = self:CaptureCurrent()
+            if #failures > 0 then return nil, 'failed to capture settings: ' .. table.concat(failures, '; ') end
+        end
         if not data then return nil, err end
         local ok, raw = pcall(httpService.JSONEncode, httpService, data)
         if not ok then return nil, 'could not encode config' end
@@ -362,26 +385,25 @@ local SaveManager = {} do
         self.StatusLabel:SetText(text)
     end
     function SaveManager:CheckPersistence()
-        local failures, count, encoded = {}, 0, self:CaptureCurrent()
+        local encoded = self:CaptureCurrent()
+        local failures, count = {}, 0
         local seen = {}
         for _, object in ipairs(encoded.objects) do seen[object.idx] = object end
-        for _, controls in ipairs({getToggles() or {}, getOptions() or {}}) do
-            for idx, control in pairs(controls) do
-                if type(control) == 'table' and not self.Ignore[idx] then
-                    count += 1
-                    if not self.Parser[control.Type] then failures[#failures + 1] = idx .. ': unsupported type'
-                    elseif not seen[idx] then failures[#failures + 1] = idx .. ': serialization failed'
-                    elseif control.Type == 'KeyPicker' and (type(seen[idx].key) ~= 'string' or seen[idx].mode ~= control.Mode or not table.find({'Always','Hold','Toggle'},seen[idx].mode)) then failures[#failures + 1] = idx .. ': keybind mismatch'
-                    elseif control.Type == 'Slider' then
-                        local value = tonumber(seen[idx].value)
-                        if not value or value ~= value or math.abs(value) == math.huge then failures[#failures + 1] = idx .. ': invalid number' end
-                    elseif control.Type == 'ColorPicker' then
-                        local object = seen[idx]
-                        if type(object.value) ~= 'string' or not object.value:match('^%x%x%x%x%x%x$') then failures[#failures + 1] = idx .. ': invalid color' end
-                        local alpha = object.transparency
-                        if alpha ~= nil and (type(alpha) ~= 'number' or alpha ~= alpha or alpha < 0 or alpha > 1) then failures[#failures + 1] = idx .. ': invalid transparency' end
-                    elseif control.Type == 'Input' and type(seen[idx].text) ~= 'string' then failures[#failures + 1] = idx .. ': invalid text' end
-                end
+        for idx, control in pairs(getControls()) do
+            if type(control) == 'table' and not self.Ignore[idx] then
+                count += 1
+                if not self.Parser[control.Type] then failures[#failures + 1] = idx .. ': unsupported type'
+                elseif not seen[idx] then failures[#failures + 1] = idx .. ': serialization failed'
+                elseif control.Type == 'KeyPicker' and (type(seen[idx].key) ~= 'string' or seen[idx].mode ~= control.Mode or not table.find({'Always','Hold','Toggle'},seen[idx].mode)) then failures[#failures + 1] = idx .. ': keybind mismatch'
+                elseif control.Type == 'Slider' then
+                    local value = tonumber(seen[idx].value)
+                    if not value or value ~= value or math.abs(value) == math.huge then failures[#failures + 1] = idx .. ': invalid number' end
+                elseif control.Type == 'ColorPicker' then
+                    local object = seen[idx]
+                    if type(object.value) ~= 'string' or not object.value:match('^%x%x%x%x%x%x$') then failures[#failures + 1] = idx .. ': invalid color' end
+                    local alpha = object.transparency
+                    if alpha ~= nil and (type(alpha) ~= 'number' or alpha ~= alpha or alpha < 0 or alpha > 1) then failures[#failures + 1] = idx .. ': invalid transparency' end
+                elseif control.Type == 'Input' and type(seen[idx].text) ~= 'string' then failures[#failures + 1] = idx .. ': invalid text' end
             end
         end
         local ok, raw = pcall(httpService.JSONEncode, httpService, encoded)
@@ -399,7 +421,8 @@ local SaveManager = {} do
 
 		local fullPath = self.Folder .. '/settings/' .. clean .. '.json'
 
-		local data = self:CaptureCurrent()
+		local data, failures = self:CaptureCurrent()
+		if #failures > 0 then return false, 'failed to capture settings: ' .. table.concat(failures, '; ') end
 
 		local success, encoded = pcall(httpService.JSONEncode, httpService, data)
 		if not success then
@@ -483,7 +506,7 @@ local SaveManager = {} do
 		if lib and lib.BeforeConfigLoad then pcall(lib.BeforeConfigLoad) end
         local report = {Loaded = 0, Missing = 0, Ignored = 0, Skipped = 0, Failed = 0, Details = {}}
         self.LastLoadReport = report
-        local controls, options, applied = getToggles() or {}, getOptions() or {}, {}
+        local controls, applied = getControls(), {}
         local function reject(kind, idx, reason)
             report[kind] += 1
             report.Details[#report.Details + 1] = tostring(idx) .. ': ' .. reason
@@ -492,13 +515,19 @@ local SaveManager = {} do
             local idx = option.idx
             if type(idx) ~= 'string' or not self.Parser[option.type] then reject('Failed', idx, 'unsupported or invalid entry'); return false end
             if self.Ignore[idx] then reject('Ignored', idx, 'excluded from persistence'); return false end
-            local control = controls[idx] or options[idx]
+            local control = controls[idx]
             if not control then reject('Missing', idx, 'control does not exist'); return false end
             if control.Type and control.Type ~= option.type then reject('Failed', idx, 'control type mismatch'); return false end
             local category = self:GetCategory(idx)
             if categories and next(categories) and not categories[category] and not table.find(categories, category) then reject('Skipped', idx, 'category not selected'); return false end
             if option.type == 'Slider' and (not tonumber(option.value) or tonumber(option.value) ~= tonumber(option.value) or math.abs(tonumber(option.value)) == math.huge) then reject('Failed', idx, 'invalid numeric value'); return false end
             if option.type == 'ColorPicker' and (type(option.value) ~= 'string' or not option.value:match('^%x%x%x%x%x%x$')) then reject('Failed', idx, 'invalid color'); return false end
+            if option.type == 'ColorPicker' then
+                local alpha, speed = option.transparency, option.chromaSpeed
+                if alpha ~= nil and (type(alpha) ~= 'number' or alpha ~= alpha or alpha < 0 or alpha > 1) then reject('Failed', idx, 'invalid transparency'); return false end
+                if speed ~= nil and (type(speed) ~= 'number' or speed ~= speed or speed < 1 or speed > 5) then reject('Failed', idx, 'invalid chroma speed'); return false end
+                if option.rgb ~= nil and type(option.rgb) ~= 'boolean' then reject('Failed', idx, 'invalid chroma state'); return false end
+            end
             if option.type == 'KeyPicker' and (type(option.key) ~= 'string' or not table.find({'Always','Toggle','Hold'}, option.mode or 'Toggle')) then reject('Failed', idx, 'invalid keybind'); return false end
             if option.type == 'Input' and type(option.text) ~= 'string' then reject('Failed', idx, 'invalid text'); return false end
             if applied[idx] then reject('Skipped', idx, 'duplicate control entry'); return false end
