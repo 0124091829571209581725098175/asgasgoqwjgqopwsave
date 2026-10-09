@@ -5,9 +5,14 @@ local SaveManager = {} do
 	SaveManager.Ignore = {}
 	SaveManager.AutoloadLabel = nil
 	SaveManager.Library = nil
-	SaveManager.PhowgRevision = 3
+	SaveManager.PhowgRevision = 4
 	SaveManager.SchemaVersion = 1
 	SaveManager.IndexAliases = {}
+    SaveManager.States = {}
+    function SaveManager:RegisterState(idx, capture, apply, category)
+        assert(type(idx) == 'string' and type(capture) == 'function' and type(apply) == 'function', 'invalid persistent state')
+        self.States[idx] = {Capture = capture, Apply = apply, Category = category or self:GetCategory(idx)}
+    end
 	SaveManager.Migrations = {
 		[0] = function(data)
 			data.schemaVersion = 1
@@ -256,7 +261,7 @@ local SaveManager = {} do
 	end
 
     function SaveManager:CaptureCurrent()
-        local data, failures = {schemaVersion = self.SchemaVersion, objects = {}}, {}
+        local data, failures = {schemaVersion = self.SchemaVersion, objects = {}, states = {}}, {}
         for idx, control in pairs(getControls()) do
             local parser = type(control) == 'table' and self.Parser[control.Type]
             if not self.Ignore[idx] then
@@ -269,6 +274,13 @@ local SaveManager = {} do
                 else
                     failures[#failures + 1] = idx .. ': ' .. tostring(object)
                 end
+            end
+        end
+        for idx, state in pairs(self.States) do
+            if not self.Ignore[idx] then
+                local ok, value = pcall(state.Capture)
+                if ok and value ~= nil then data.states[idx] = value
+                else failures[#failures + 1] = idx .. ': ' .. tostring(value or 'state capture returned nil') end
             end
         end
         table.sort(data.objects, function(a, b) return a.idx < b.idx end)
@@ -309,7 +321,11 @@ local SaveManager = {} do
         local data, err = self:ReadConfig(name)
         if not data then return nil, err end
         local current, changes = {}, {}
-        for _, object in ipairs(self:CaptureCurrent().objects) do current[object.idx] = object end
+        local captured = self:CaptureCurrent()
+        for _, object in ipairs(captured.objects) do current[object.idx] = object end
+        for idx, value in pairs(type(data.states) == 'table' and data.states or {}) do
+            if not equal(captured.states[idx], value) then changes[#changes + 1] = idx .. ': saved state differs' end
+        end
         for _, object in ipairs(data.objects) do
             local old = current[object.idx]
             if not old then changes[#changes + 1] = object.idx .. ': missing or ignored'
@@ -385,8 +401,9 @@ local SaveManager = {} do
         self.StatusLabel:SetText(text)
     end
     function SaveManager:CheckPersistence()
-        local encoded = self:CaptureCurrent()
-        local failures, count = {}, 0
+        local encoded, failures = self:CaptureCurrent()
+        local count = 0
+        for idx in pairs(self.States) do if not self.Ignore[idx] then count += 1 end end
         local seen = {}
         for _, object in ipairs(encoded.objects) do seen[object.idx] = object end
         for idx, control in pairs(getControls()) do
@@ -503,13 +520,28 @@ local SaveManager = {} do
 			end
 			if updateDependencies then lib.UpdateDependencyBoxes = function() end end
 		end
-		if lib and lib.BeforeConfigLoad then pcall(lib.BeforeConfigLoad) end
+		if lib and lib.BeforeConfigLoad then pcall(lib.BeforeConfigLoad, decoded, categories) end
         local report = {Loaded = 0, Missing = 0, Ignored = 0, Skipped = 0, Failed = 0, Details = {}}
         self.LastLoadReport = report
         local controls, applied = getControls(), {}
         local function reject(kind, idx, reason)
             report[kind] += 1
             report.Details[#report.Details + 1] = tostring(idx) .. ': ' .. reason
+        end
+        if decoded.states ~= nil and type(decoded.states) ~= 'table' then
+            reject('Failed', 'states', 'invalid persistent states')
+        else
+            for idx, value in pairs(decoded.states or {}) do
+                local state = self.States[idx]
+                if type(idx) ~= 'string' or not state then reject('Missing', idx, 'persistent state does not exist')
+                elseif self.Ignore[idx] then reject('Ignored', idx, 'excluded from persistence')
+                elseif categories and next(categories) and not categories[state.Category] and not table.find(categories, state.Category) then reject('Skipped', idx, 'category not selected')
+                else
+                    local ok, result, problem = pcall(state.Apply, value)
+                    if ok and result ~= false then report.Loaded += 1
+                    else reject('Failed', idx, tostring(ok and problem or result)) end
+                end
+            end
         end
         local function allowed(option)
             local idx = option.idx
