@@ -5,7 +5,7 @@ local SaveManager = {} do
 	SaveManager.Ignore = {}
 	SaveManager.AutoloadLabel = nil
 	SaveManager.Library = nil
-	SaveManager.PhowgRevision = 4
+	SaveManager.PhowgRevision = 5
 	SaveManager.SchemaVersion = 1
 	SaveManager.IndexAliases = {}
     SaveManager.States = {}
@@ -161,7 +161,7 @@ local SaveManager = {} do
 					end
 
 					if obj.SetValue then
-						obj:SetValue(v)
+						obj:SetValue(v, idx == 'void_hide' or idx == 'underground' or idx == 'desync_rotation')
 					else
 						obj.Value = v
 						if obj.Display then pcall(function() obj:Display() end) end
@@ -673,6 +673,26 @@ local SaveManager = {} do
 		if _G then pcall(function() _G.SaveManager = self end) end
 	end
 
+    function SaveManager:RemoveAutoload()
+        local path = self.Folder .. '/settings/autoload.txt'
+        local exists, present = pcall(isfile, path)
+        if not exists then return false, tostring(present) end
+        if present then
+            local removed = false
+            if type(delfile) == 'function' then
+                local ok = pcall(delfile, path)
+                local checked, remains = pcall(isfile, path)
+                removed = ok and checked and not remains
+            end
+            if not removed then
+                local ok, err = pcall(writefile, path, '')
+                if not ok then return false, tostring(err) end
+            end
+        end
+        if self.AutoloadLabel then self.AutoloadLabel:SetText('Current autoload config: none') end
+        return true
+    end
+
 	function SaveManager:LoadAutoloadConfig()
 		task.spawn(function()
 			local okFile, isFile = pcall(isfile, self.Folder .. '/settings/autoload.txt')
@@ -796,6 +816,11 @@ local SaveManager = {} do
 			self.Library:Notify(string.format('Set %q to auto load', clean))
 			return nil
 		end)
+
+        section:AddButton('Remove autoload', function()
+            local ok, err = self:RemoveAutoload()
+            self.Library:Notify(ok and 'Autoload removed' or 'Failed to remove autoload: ' .. tostring(err), 3)
+        end)
 
         section:AddDropdown('SaveManager_Categories', {Text = 'load categories (empty = all)', Values = {'visuals','movement','protection','interface','other'}, Multi = true, AllowNull = true})
         section:AddInput('SaveManager_ImportText', {Text = 'import JSON', Finished = true})
