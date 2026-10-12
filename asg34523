@@ -5,13 +5,18 @@ local SaveManager = {} do
 	SaveManager.Ignore = {}
 	SaveManager.AutoloadLabel = nil
 	SaveManager.Library = nil
-	SaveManager.PhowgRevision = 5
+	SaveManager.PhowgRevision = 6
 	SaveManager.SchemaVersion = 1
 	SaveManager.IndexAliases = {}
     SaveManager.States = {}
+    SaveManager.Baseline = {Controls = {}, States = {}}
+    SaveManager.DirtyControls, SaveManager.DirtyStates, SaveManager.DirtyReasons = {}, {}, {}
+    SaveManager.ObservedControls, SaveManager.StatusListeners = {}, {}
+    SaveManager.TrackingReady = false
     function SaveManager:RegisterState(idx, capture, apply, category)
         assert(type(idx) == 'string' and type(capture) == 'function' and type(apply) == 'function', 'invalid persistent state')
         self.States[idx] = {Capture = capture, Apply = apply, Category = category or self:GetCategory(idx)}
+        if self.ObserveState then self:ObserveState(idx) end
     end
 	SaveManager.Migrations = {
 		[0] = function(data)
@@ -252,7 +257,9 @@ local SaveManager = {} do
 	function SaveManager:SetIgnoreIndexes(list)
 		for _, key in next, list do
 			self.Ignore[key] = true
+            self.DirtyControls[key], self.DirtyStates[key] = nil, nil
 		end
+        if self.TrackingReady then self:RefreshDirtyFlag() end
 	end
 
 	function SaveManager:SetFolder(folder)
@@ -260,6 +267,15 @@ local SaveManager = {} do
 		self:BuildFolderTree()
 	end
 
+    local function copyValue(value, seen)
+        if type(value) ~= 'table' then return value end
+        seen = seen or {}
+        if seen[value] then return seen[value] end
+        local result = {}
+        seen[value] = result
+        for key, item in pairs(value) do result[key] = copyValue(item, seen) end
+        return result
+    end
     function SaveManager:CaptureCurrent()
         local data, failures = {schemaVersion = self.SchemaVersion, objects = {}, states = {}}, {}
         for idx, control in pairs(getControls()) do
@@ -279,7 +295,7 @@ local SaveManager = {} do
         for idx, state in pairs(self.States) do
             if not self.Ignore[idx] then
                 local ok, value = pcall(state.Capture)
-                if ok and value ~= nil then data.states[idx] = value
+                if ok and value ~= nil then data.states[idx] = copyValue(value)
                 else failures[#failures + 1] = idx .. ': ' .. tostring(value or 'state capture returned nil') end
             end
         end
@@ -316,6 +332,152 @@ local SaveManager = {} do
         for k, v in pairs(a) do if not equal(v, b[k]) then return false end end
         for k in pairs(b) do if a[k] == nil then return false end end
         return true
+    end
+
+    local function persistenceObject(idx, control)
+        local parser = type(control) == 'table' and SaveManager.Parser[control.Type]
+        if not parser then return nil, 'unsupported control type' end
+        local ok, object = pcall(parser.Save, idx, control)
+        if not ok or type(object) ~= 'table' then return nil, tostring(object) end
+        object.category = nil
+        return object
+    end
+    function SaveManager:RefreshDirtyFlag()
+        local dirty = next(self.DirtyControls) ~= nil or next(self.DirtyStates) ~= nil or next(self.DirtyReasons) ~= nil
+        self.Dirty = dirty
+        if self.Library then self.Library.ConfigDirty = dirty end
+        self:UpdateStatus()
+        return dirty
+    end
+    function SaveManager:ObserveState(idx)
+        local state = self.States[idx]
+        if not state or self.Ignore[idx] or self.Baseline.States[idx] ~= nil then return end
+        local ok, value = pcall(state.Capture)
+        if ok and value ~= nil then self.Baseline.States[idx] = copyValue(value) end
+    end
+    function SaveManager:MarkStateChanged(idx)
+        local lib = self.Library
+        if self.Loading or (lib and (lib.SuppressSave or lib.ConfigLoading or lib.Unloaded)) then return end
+        local state = self.States[idx]
+        if not state or self.Ignore[idx] then return end
+        local ok, value = pcall(state.Capture)
+        if not ok or value == nil then self.DirtyStates[idx] = true
+        else self.DirtyStates[idx] = not equal(value, self.Baseline.States[idx]) or nil end
+        self:RefreshDirtyFlag()
+    end
+    function SaveManager:ObserveControl(idx, control)
+        if type(idx) ~= 'string' or type(control) ~= 'table' or not self.Parser[control.Type] then return end
+        if self.ObservedControls[control] then return end
+        self.ObservedControls[control] = idx
+        local snapshot = persistenceObject(idx, control)
+        if snapshot and not self.Ignore[idx] and self.Baseline.Controls[idx] == nil then self.Baseline.Controls[idx] = copyValue(snapshot) end
+        for _, method in ipairs({'SetValue', 'SetValueRGB'}) do
+            local original = control[method]
+            if type(original) == 'function' then
+                control[method] = function(object, ...)
+                    local results = table.pack(original(object, ...))
+                    if self.Library and not self.Library.Unloaded then self:OnControlChanged(idx, object) end
+                    return table.unpack(results, 1, results.n)
+                end
+            end
+        end
+    end
+    function SaveManager:SetBaseline(data)
+        local failures
+        if not data then data, failures = self:CaptureCurrent() end
+        if failures and #failures > 0 then
+            self.DirtyReasons.capture = true
+            self:RefreshDirtyFlag()
+            return false, table.concat(failures, '; ')
+        end
+        local baseline = {Controls = {}, States = {}}
+        for _, object in ipairs(data.objects or {}) do
+            if not self.Ignore[object.idx] then
+                local value = copyValue(object)
+                value.category = nil
+                baseline.Controls[object.idx] = value
+            end
+        end
+        for idx, value in pairs(data.states or {}) do if not self.Ignore[idx] then baseline.States[idx] = copyValue(value) end end
+        self.Baseline = baseline
+        table.clear(self.DirtyControls)
+        table.clear(self.DirtyStates)
+        table.clear(self.DirtyReasons)
+        self.TrackingReady = true
+        self:RefreshDirtyFlag()
+        return true
+    end
+    function SaveManager:RefreshDirtyState()
+        if not self.TrackingReady then return self:SetBaseline() end
+        table.clear(self.DirtyControls)
+        table.clear(self.DirtyStates)
+        for idx, control in pairs(getControls()) do
+            if not self.Ignore[idx] then
+                local snapshot = persistenceObject(idx, control)
+                if not snapshot or not equal(snapshot, self.Baseline.Controls[idx]) then self.DirtyControls[idx] = true end
+            end
+        end
+        for idx, state in pairs(self.States) do
+            if not self.Ignore[idx] then
+                local ok, value = pcall(state.Capture)
+                if not ok or value == nil or not equal(value, self.Baseline.States[idx]) then self.DirtyStates[idx] = true end
+            end
+        end
+        return self:RefreshDirtyFlag()
+    end
+    function SaveManager:OnControlChanged(idx, control)
+        local lib = self.Library
+        if self.Loading or (lib and (lib.SuppressSave or lib.ConfigLoading or lib.Unloaded)) then return end
+        if lib and lib.ControlsReady == false then return end
+        if type(idx) == 'string' then
+            if not self.Ignore[idx] then
+                control = control or findControl(idx)
+                if control then
+                    local snapshot = persistenceObject(idx, control)
+                    if not snapshot or not equal(snapshot, self.Baseline.Controls[idx]) then self.DirtyControls[idx] = true
+                    else self.DirtyControls[idx] = nil end
+                end
+            end
+            for stateIndex in pairs(self.States) do self:MarkStateChanged(stateIndex) end
+            self:RefreshDirtyFlag()
+            return
+        end
+        if self.DirtyCheckPending then return end
+        self.DirtyCheckPending = true
+        task.defer(function()
+            self.DirtyCheckPending = false
+            if self.Loading or (lib and (lib.SuppressSave or lib.ConfigLoading or lib.Unloaded or lib.ControlsReady == false)) then return end
+            self:RefreshDirtyState()
+        end)
+    end
+    function SaveManager:GetFilteredConfigList(query)
+        query = tostring(query or ''):lower():match('^%s*(.-)%s*$')
+        local values = {}
+        for _, name in ipairs(self:RefreshConfigList()) do if query == '' or name:lower():find(query, 1, true) then values[#values + 1] = name end end
+        return values
+    end
+    function SaveManager:RegisterStatusListener(callback)
+        assert(type(callback) == 'function', 'invalid status listener')
+        local token = {}
+        self.StatusListeners[token] = callback
+        pcall(callback, self:GetStatusText(true), self.Dirty == true, self)
+        return function() self.StatusListeners[token] = nil end
+    end
+    function SaveManager:GetStatusText(compact)
+        local state = self.Dirty and 'unsaved changes' or (self.CurrentConfig and 'saved' or 'unchanged')
+        local text = tostring(self.CurrentConfig or 'default settings') .. ' | ' .. state
+        local action = self.LastAction
+        if compact then
+            if action and not action.Success then text ..= ' | ' .. action.Kind .. ' failed' end
+            return text
+        end
+        if action then
+            text ..= '\nlast action: ' .. action.Kind .. (action.Success and ' complete' or (' failed: ' .. tostring(action.Message)))
+        end
+        text ..= '\nlast save: ' .. (self.LastSavedAt and os.date('%H:%M:%S', self.LastSavedAt) or 'never')
+        local report = self.LastLoadReport
+        if report then text ..= string.format('\nloaded %d | missing %d | ignored %d | skipped %d | failed %d', report.Loaded, report.Missing, report.Ignored, report.Skipped, report.Failed) end
+        return text
     end
     function SaveManager:Compare(name)
         local data, err = self:ReadConfig(name)
@@ -392,13 +554,13 @@ local SaveManager = {} do
         return true
     end
     function SaveManager:UpdateStatus()
-        if not self.StatusLabel then return end
-        local dirty = self.Library and self.Library.ConfigDirty
-        local saved = self.LastSavedAt and os.date('%H:%M:%S', self.LastSavedAt) or 'never'
-        local text = tostring(self.CurrentConfig or 'no config') .. ' | ' .. (dirty and 'unsaved changes' or 'saved') .. '\nlast save: ' .. saved
-        local r = self.LastLoadReport
-        if r then text ..= string.format('\nloaded %d | missing %d | ignored %d | skipped %d | failed %d', r.Loaded, r.Missing, r.Ignored, r.Skipped, r.Failed) end
-        self.StatusLabel:SetText(text)
+        local text = self:GetStatusText(false)
+        if self.StatusLabel and self.StatusText ~= text then self.StatusLabel:SetText(text); self.StatusText = text end
+        local compact = self:GetStatusText(true)
+        if self.CompactStatusText ~= compact then
+            self.CompactStatusText = compact
+            for _, callback in pairs(self.StatusListeners) do pcall(callback, compact, self.Dirty == true, self) end
+        end
     end
     function SaveManager:CheckPersistence()
         local encoded, failures = self:CaptureCurrent()
@@ -471,7 +633,8 @@ local SaveManager = {} do
 			return false, 'writefile failed: '..tostring(err)
 		end
 		self.LastSavedAt, self.CurrentConfig = os.time(), clean
-		if self.Library then self.Library.ConfigDirty = false end
+        self:SetBaseline(data)
+        self:RefreshDirtyState()
 		self:UpdateStatus()
 		return true
 	end
@@ -498,7 +661,9 @@ local SaveManager = {} do
 		if not migrated then return false, migrationError end
 		decoded = migrated
 
-        return self:ApplyConfig(decoded, clean, categories)
+        local applied, problem = self:ApplyConfig(decoded, clean, categories)
+        if applied and fromBackup then self.DirtyReasons.backup = true; self:RefreshDirtyFlag() end
+        return applied, problem
     end
     function SaveManager:ApplyConfig(decoded, name, categories)
 		if self.Loading then return false, 'a config is already loading' end
@@ -611,8 +776,13 @@ local SaveManager = {} do
 			if lib.AfterConfigLoad then pcall(lib.AfterConfigLoad) end
 		end
 		self.Loading = false
-        self.CurrentConfig = name or self.CurrentConfig
-        if lib then lib.ConfigDirty = (categories and next(categories) ~= nil) or report.Failed > 0 or report.Missing > 0 end
+        if report.Failed == 0 then self.CurrentConfig = name or self.CurrentConfig end
+        if not (categories and next(categories)) and report.Failed == 0 and report.Missing == 0 then
+            self:SetBaseline()
+        else
+            self.DirtyReasons.load = report.Failed > 0 or report.Missing > 0 or (categories and next(categories) ~= nil) or nil
+            self:RefreshDirtyState()
+        end
         self:UpdateStatus()
 		if #errors > 0 then return false, 'failed to load ' .. table.concat(errors, '; ') end
         if report.Failed > 0 then return false, tostring(report.Failed) .. ' invalid config entries; see load report' end
@@ -647,28 +817,27 @@ local SaveManager = {} do
 		end
 	end
 
-	function SaveManager:RefreshConfigList()
-		local ok, list = pcall(listfiles, self.Folder .. '/settings')
-		if not ok or type(list) ~= 'table' then return {} end
-
-		local out = {}
-		for i = 1, #list do
-			local file = list[i]
-			if type(file) == 'string' and file:sub(-5):lower() == '.json' then
-				local name = file:gsub('\\', '/')
-				name = name:match("([^/]+)%.json$")
-				if name and name ~= '' then
-					table.insert(out, name)
-				end
-			end
-		end
-		
-		return out
-	end
+    function SaveManager:RefreshConfigList()
+        local ok, list = pcall(listfiles, self.Folder .. '/settings')
+        if not ok or type(list) ~= 'table' then return {} end
+        local values, seen = {}, {}
+        for _, file in ipairs(list) do
+            if type(file) == 'string' and file:sub(-5):lower() == '.json' then
+                local basename = file:gsub('\\', '/'):match('([^/]+)$')
+                local name = basename and NormalizeConfigName(basename:sub(1, -6))
+                if name and not seen[name] then seen[name] = true; values[#values + 1] = name end
+            end
+        end
+        table.sort(values, function(a, b) return a:lower() == b:lower() and a < b or a:lower() < b:lower() end)
+        return values
+    end
 
 	function SaveManager:SetLibrary(library)
 		self.Library = library
 		library.SaveManager = self
+        for idx, control in pairs(getControls()) do self:ObserveControl(idx, control) end
+        for idx in pairs(self.States) do self:ObserveState(idx) end
+        self:SetBaseline()
 		if getgenv then pcall(function() getgenv().SaveManager = self end) end
 		if _G then pcall(function() _G.SaveManager = self end) end
 	end
@@ -731,7 +900,7 @@ local SaveManager = {} do
 		local section = tab:AddRightGroupbox('Configuration')
 
 		section:AddInput('SaveManager_ConfigName',    { Text = 'Config name' })
-		section:AddDropdown('SaveManager_ConfigList', { Text = 'Config list', Values = self:RefreshConfigList(), AllowNull = true })
+		section:AddSearchDropdown('SaveManager_ConfigList', { Text = 'Config list', Values = self:RefreshConfigList(), AllowNull = true })
 
 		section:AddDivider()
 
@@ -809,7 +978,8 @@ local SaveManager = {} do
 			if not clean then
 				return self.Library:Notify('Select a config first', 2)
 			end
-			writefile(self.Folder .. '/settings/autoload.txt', clean)
+            local wrote, problem = pcall(writefile, self.Folder .. '/settings/autoload.txt', clean)
+            if not wrote then return self.Library:Notify('Failed to set autoload: ' .. tostring(problem)) end
 			if SaveManager.AutoloadLabel then
 				SaveManager.AutoloadLabel:SetText('Current autoload config: ' .. clean)
 			end
@@ -824,7 +994,8 @@ local SaveManager = {} do
 
         section:AddDropdown('SaveManager_Categories', {Text = 'load categories (empty = all)', Values = {'visuals','movement','protection','interface','other'}, Multi = true, AllowNull = true})
         section:AddInput('SaveManager_ImportText', {Text = 'import JSON', Finished = true})
-        self.StatusLabel = section:AddLabel('no config | last save: never', true)
+        self.StatusLabel = section:AddLabel(self:GetStatusText(false), true)
+        self.StatusText = nil
         self.DetailLabel = section:AddLabel('', true)
         section:AddButton('Compare selected config', function()
             local opts = getOptions()
@@ -873,6 +1044,16 @@ local SaveManager = {} do
 
 		SaveManager:SetIgnoreIndexes({ 'SaveManager_ConfigList', 'SaveManager_ConfigName' })
 	end
+
+    for _, kind in ipairs({'Save', 'Load', 'Import', 'Rename', 'RemoveAutoload'}) do
+        local original = SaveManager[kind]
+        SaveManager[kind] = function(self, ...)
+            local results = table.pack(original(self, ...))
+            self.LastAction = {Kind = kind:lower(), Success = results[1] == true, Message = results[2], At = os.time()}
+            self:UpdateStatus()
+            return table.unpack(results, 1, results.n)
+        end
+    end
 
 	SaveManager:BuildFolderTree()
 end
