@@ -897,14 +897,14 @@ local SaveManager = {} do
 	function SaveManager:BuildConfigSection(tab)
 		assert(self.Library, 'Must set SaveManager.Library')
 
-		local section = tab:AddRightGroupbox('Configuration')
+		local section = tab:AddLeftGroupbox('Profiles')
 
-		section:AddInput('SaveManager_ConfigName',    { Text = 'Config name' })
-		section:AddSearchDropdown('SaveManager_ConfigList', { Text = 'Config list', Values = self:RefreshConfigList(), AllowNull = true })
+		section:AddSearchDropdown('SaveManager_ConfigList', { Text = 'Profiles', Values = self:RefreshConfigList(), AllowNull = true })
+		section:AddInput('SaveManager_ConfigName', { Text = 'Config Name' })
 
 		section:AddDivider()
 
-		section:AddButton('Create config', function()
+		section:AddButton('Create Config', function()
 			local opts = getOptions()
 			local name = (opts.SaveManager_ConfigName and opts.SaveManager_ConfigName.Value) or (Options and Options.SaveManager_ConfigName and Options.SaveManager_ConfigName.Value)
 			local clean = NormalizeConfigName(name)
@@ -928,7 +928,8 @@ local SaveManager = {} do
 				Options.SaveManager_ConfigList:SetValue(nil)
 			end
 			return nil
-		end):AddButton('Load config', function()
+		end)
+        section:AddButton('Load Config', function()
 			local opts = getOptions()
 			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options and Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
 
@@ -942,7 +943,7 @@ local SaveManager = {} do
 			return nil
 		end)
 
-		section:AddButton('Overwrite config', function()
+		section:AddButton('Save Config', function()
 			local opts = getOptions()
 			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options and Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
 
@@ -955,7 +956,7 @@ local SaveManager = {} do
 			return nil
 		end)
 
-		section:AddButton('Refresh list', function()
+		section:AddButton('Refresh Configs', function()
 			local opts = getOptions()
 			local target = (opts and opts.SaveManager_ConfigList) or (Options and Options.SaveManager_ConfigList)
 			if target then
