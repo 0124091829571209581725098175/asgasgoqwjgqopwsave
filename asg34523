@@ -904,7 +904,7 @@ local SaveManager = {} do
 
 		section:AddDivider()
 
-		section:AddButton('Create Config', function()
+		section:AddButton('create', function()
 			local opts = getOptions()
 			local name = (opts.SaveManager_ConfigName and opts.SaveManager_ConfigName.Value) or (Options and Options.SaveManager_ConfigName and Options.SaveManager_ConfigName.Value)
 			local clean = NormalizeConfigName(name)
@@ -928,8 +928,7 @@ local SaveManager = {} do
 				Options.SaveManager_ConfigList:SetValue(nil)
 			end
 			return nil
-		end)
-        section:AddButton('Load Config', function()
+		end):AddButton('load', function()
 			local opts = getOptions()
 			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options and Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
 
@@ -943,7 +942,7 @@ local SaveManager = {} do
 			return nil
 		end)
 
-		section:AddButton('Save Config', function()
+		section:AddButton('save', function()
 			local opts = getOptions()
 			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options and Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
 
@@ -954,9 +953,7 @@ local SaveManager = {} do
 
 			self.Library:Notify(string.format('Overwrote config %q', tostring(name)))
 			return nil
-		end)
-
-		section:AddButton('Refresh Configs', function()
+		end):AddButton('refresh', function()
 			local opts = getOptions()
 			local target = (opts and opts.SaveManager_ConfigList) or (Options and Options.SaveManager_ConfigList)
 			if target then
@@ -964,7 +961,7 @@ local SaveManager = {} do
 				target:SetValue(nil)
 			end
 		end)
-		section:AddButton('Load previous save', function()
+		section:AddButton('restore previous save', function()
 			local opts = getOptions()
 			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options and Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
 			local success, err = self:Load(name, true)
@@ -972,7 +969,7 @@ local SaveManager = {} do
 			self.Library:Notify('Loaded previous save. Use Overwrite config to keep it.')
 		end)
 
-		section:AddButton('Set as autoload', function()
+		section:AddButton('set autoload', function()
 			local opts = getOptions()
 			local name = (opts.SaveManager_ConfigList and opts.SaveManager_ConfigList.Value) or (Options and Options.SaveManager_ConfigList and Options.SaveManager_ConfigList.Value)
 			local clean = NormalizeConfigName(name)
@@ -986,44 +983,41 @@ local SaveManager = {} do
 			end
 			self.Library:Notify(string.format('Set %q to auto load', clean))
 			return nil
-		end)
-
-        section:AddButton('Remove autoload', function()
+		end):AddButton('clear autoload', function()
             local ok, err = self:RemoveAutoload()
             self.Library:Notify(ok and 'Autoload removed' or 'Failed to remove autoload: ' .. tostring(err), 3)
         end)
 
-        section:AddDropdown('SaveManager_Categories', {Text = 'load categories (empty = all)', Values = {'visuals','movement','protection','interface','other'}, Multi = true, AllowNull = true})
-        section:AddInput('SaveManager_ImportText', {Text = 'import JSON', Finished = true})
         self.StatusLabel = section:AddLabel(self:GetStatusText(false), true)
         self.StatusText = nil
-        self.DetailLabel = section:AddLabel('', true)
-        section:AddButton('Compare selected config', function()
+        section:AddToggle('SaveManager_Advanced', {Text = 'advanced options', Default = false})
+        local tools = section:AddSettingsBox(self.Library.Toggles.SaveManager_Advanced)
+        tools:AddDropdown('SaveManager_Categories', {Text = 'load categories (empty = all)', Values = {'visuals','movement','protection','interface','other'}, Multi = true, AllowNull = true})
+        tools:AddInput('SaveManager_ImportText', {Text = 'import JSON', Finished = true})
+        self.DetailLabel = tools:AddLabel('', true)
+        tools:AddButton('compare', function()
             local opts = getOptions()
             local changes, err = self:Compare(opts.SaveManager_ConfigList.Value)
             self.DetailLabel:SetText(changes and (#changes .. ' differences\n' .. table.concat(changes, '\n')) or tostring(err))
-        end)
-        section:AddButton('Show load report', function()
+        end):AddButton('load report', function()
             self.DetailLabel:SetText(self.LastLoadReport and table.concat(self.LastLoadReport.Details, '\n') or 'No config loaded yet')
         end)
-        section:AddButton('Export selected config', function()
+        tools:AddButton('export', function()
             local raw, err = self:Export(getOptions().SaveManager_ConfigList.Value)
             if raw and setclipboard then local ok = pcall(setclipboard, raw); self.Library:Notify(ok and 'Config copied' or 'Clipboard unavailable')
             else self.Library:Notify(err or 'Clipboard unavailable') end
-        end)
-        section:AddButton('Import as new config', function()
+        end):AddButton('import', function()
             local opts = getOptions()
             local ok, err = self:Import(opts.SaveManager_ConfigName.Value, opts.SaveManager_ImportText.Value)
             self.Library:Notify(ok and 'Config imported' or tostring(err))
             if ok then opts.SaveManager_ConfigList:SetValues(self:RefreshConfigList()) end
         end)
-        section:AddButton('Rename selected config', function()
+        tools:AddButton('rename', function()
             local opts = getOptions()
             local ok, err = self:Rename(opts.SaveManager_ConfigList.Value, opts.SaveManager_ConfigName.Value)
             self.Library:Notify(ok and 'Config renamed' or tostring(err))
             if ok then opts.SaveManager_ConfigList:SetValues(self:RefreshConfigList()); opts.SaveManager_ConfigList:SetValue(nil) end
-        end)
-        section:AddButton('Check setting persistence', function()
+        end):AddButton('check persistence', function()
             local ok, count, failures = self:CheckPersistence()
             self.DetailLabel:SetText(ok and (count .. ' controls serialize correctly') or table.concat(failures, '\n'))
         end)
