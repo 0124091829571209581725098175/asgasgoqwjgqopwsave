@@ -5,8 +5,9 @@ local SaveManager = {} do
 	SaveManager.Ignore = {}
 	SaveManager.AutoloadLabel = nil
 	SaveManager.Library = nil
-	SaveManager.PhowgRevision = 7
-    SaveManager.FrameBatchedLoading = true
+	SaveManager.PhowgRevision = 8
+    SaveManager.FrameBatchedLoading = false
+    SaveManager.AtomicConfigLoading = true
 	SaveManager.SchemaVersion = 1
 	SaveManager.IndexAliases = {}
     SaveManager.States = {}
@@ -743,10 +744,8 @@ local SaveManager = {} do
 				else table.insert(others, option) end
 			end
 		end
-        local applyStarted=os.clock()
         local function apply(option)
             if lib and lib.Unloaded then return end
-            if os.clock()-applyStarted>=0.002 then task.wait();applyStarted=os.clock() end
 			local ok, err = pcall(self.Parser[option.type].Load, option.idx, option)
 			if not ok then errors[#errors + 1] = option.idx .. ': ' .. tostring(err); reject('Failed', option.idx, tostring(err)) else report.Loaded += 1 end
 		end
@@ -765,12 +764,10 @@ local SaveManager = {} do
             self.Loading=false
             return false,'config loading cancelled'
         end
-        local callbackStarted=os.clock()
         local function dispatch(entry)
             if lib and lib.Unloaded then return end
             local ok,err=pcall(safeCallback,lib,entry.Callback,table.unpack(entry.Arguments,1,entry.Arguments.n))
             if not ok then errors[#errors+1]=tostring(err);warn('[phowg] config callback: '..tostring(err)) end
-            if os.clock()-callbackStarted>=0.002 then task.wait();callbackStarted=os.clock() end
         end
 		for index = 1, protectionCallbacks do dispatch(callbacks[index]) end
 		if lib and lib.AfterProtectionConfigLoad then pcall(lib.AfterProtectionConfigLoad) end
@@ -780,7 +777,7 @@ local SaveManager = {} do
 			lib.SuppressSave = prevSuppress or false
 			lib.ConfigLoading = prevLoading or false
 			if lib.AfterConfigLoad then pcall(lib.AfterConfigLoad) end
-            if lib.FlushDeferredLayouts then lib:FlushDeferredLayouts() end
+            if lib.FlushDeferredLayouts then lib:FlushDeferredLayouts(true) end
             if lib.RefreshVisiblePlayerDropdowns then lib:RefreshVisiblePlayerDropdowns() end
 		end
 		self.Loading = false
@@ -870,8 +867,8 @@ local SaveManager = {} do
         return true
     end
 
-	function SaveManager:LoadAutoloadConfig()
-		task.spawn(function()
+	function SaveManager:LoadAutoloadConfig(blocking)
+		local function load()
 			local okFile, isFile = pcall(isfile, self.Folder .. '/settings/autoload.txt')
 			if not okFile or not isFile then return end
 			local okRead, name = pcall(readfile, self.Folder .. '/settings/autoload.txt')
@@ -879,7 +876,6 @@ local SaveManager = {} do
 			local clean = NormalizeConfigName(name)
 			if not clean then return end
 
-			-- Wait for UI controls to be registered before applying (max 5 seconds)
 			for _ = 1, 50 do
 				local t = getToggles()
 				local o = getOptions()
@@ -899,8 +895,10 @@ local SaveManager = {} do
 			if self.Library then
 				self.Library:Notify(string.format('Auto loaded config %q', clean))
 			end
-		end)
-	end
+        end
+        if blocking then return load() end
+        return task.spawn(load)
+    end
 
 	function SaveManager:BuildConfigSection(tab)
 		assert(self.Library, 'Must set SaveManager.Library')
